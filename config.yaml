@@ -1,0 +1,232 @@
+# Stock Options ML Agent Configuration
+# Last Updated: 2024-05-21
+
+# API Configuration
+api:
+  massive_com:
+    api_key: ${MASSIVE_COM_API_KEY}
+    base_url: "https://api.massive.com"
+    timeout: 30
+    max_retries: 3
+    retry_delay: 2
+
+  polygon:
+    api_key: ${POLYGON_API_KEY}  # Optional, higher quality
+    enabled: false
+
+# Data Configuration
+data:
+  lookback_days: 252              # 1 year historical
+  refresh_interval: 3600          # 1 hour (seconds)
+  cache_enabled: true
+  cache_ttl: 3600                 # 1 hour
+  cache_dir: "data/cache"
+
+  batch_size: 100                 # Tickers per batch
+  max_retries: 3
+
+# Technical Analysis
+technical:
+  indicators:
+    sma_periods: [20, 50, 200]
+    ema_periods: [12, 26, 50]
+    rsi_period: 14
+    rsi_oversold: 30
+    rsi_overbought: 70
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    bollinger_period: 20
+    bollinger_std: 2
+    atr_period: 14
+    stochastic_period: 14
+    adx_period: 14
+
+  support_resistance:
+    lookback: 252
+    min_touches: 2
+    distance_threshold: 0.01  # 1%
+
+# ML Models Configuration
+models:
+  direction_model:
+    type: "xgboost"
+    name: "xgboost_direction.pkl"
+    lookback: 252
+    n_estimators: 200
+    max_depth: 7
+    learning_rate: 0.05
+    test_split: 0.2
+
+  volatility_model:
+    type: "xgboost"
+    name: "volatility_model.pkl"
+    lookback: 252
+    n_estimators: 200
+
+  options_nn:
+    type: "neural_network"
+    name: "options_nn.h5"
+    lookback: 50
+    input_dim: 50
+    hidden_layers: [128, 64, 32]
+    dropout: 0.3
+
+  training:
+    retrain_frequency: "monthly"  # monthly or after_regime_change
+    min_samples_required: 500
+
+# Strategy Configuration
+strategy:
+  default_expiration: 28          # days
+  min_dte: 7                      # minimum days to expiration
+  max_dte: 60                     # maximum days to expiration
+
+  bull_call_spread:
+    long_delta: 0.70
+    short_delta: 0.30
+    min_credit: 0.20
+
+  bear_call_spread:
+    long_delta: -0.30
+    short_delta: -0.70
+    min_credit: 0.20
+
+  cash_secured_put:
+    target_delta: -0.30
+    min_credit: 0.20
+
+  covered_call:
+    call_delta: 0.30
+    min_credit: 0.20
+
+  iron_condor:
+    strike_width: 0.02            # 2% of stock price
+    width_min: 1.0
+    width_max: 5.0
+
+  straddle:
+    target_delta: 0
+    min_iv_percentile: 75
+
+  calendar_spread:
+    near_term_dte: 21
+    long_term_dte: 56
+
+  strangle:
+    call_delta: 0.30
+    put_delta: -0.30
+
+# Risk Management
+risk:
+  max_loss_per_trade: 0.02        # 2% of account
+  position_size_method: "kelly"   # kelly or fixed
+  kelly_fraction: 0.25            # 25% Kelly
+
+  # Position sizing parameters
+  max_positions: 10               # Max open positions
+  correlation_limit: 0.70         # Max correlation between positions
+
+  # Stop loss settings
+  stop_loss_atr_multiple: 2.0
+  use_hard_stops: true
+
+  # Greeks management
+  max_delta: 1.0                  # Per position
+  max_theta: 0.50                 # Per position
+  max_vega: 1.0                   # Per position
+
+# Execution Configuration
+execution:
+  order_type: "limit"             # limit or market
+  order_slippage: 0.01            # 1% slippage estimate
+  market_hours_only: true
+  market_open: "09:30"            # EST
+  market_close: "16:00"           # EST
+
+  # Entry/exit timing
+  enter_after_market_open_min: 15 # Minutes after open
+  close_before_market_close_min: 15 # Minutes before close
+
+# Catalyst Configuration
+catalyst:
+  look_ahead_days: 60
+  sources:
+    - "earnings"
+    - "economic"
+    - "fomc"
+    - "political"
+    - "custom_events"
+
+  earnings_impact: "HIGH"
+  earnings_look_ahead: 14         # Days
+
+  economic_calendar: true
+  fomc_events: true
+
+# Sentiment Configuration
+sentiment:
+  enabled: true
+  sources:
+    - "news"
+    - "social_media"
+    - "analyst_ratings"
+
+  lookback_days: 30
+  sentiment_weights:
+    recent: 1.0
+    7d_ma: 0.7
+    30d_ma: 0.5
+
+  min_sentiment_articles: 5
+
+# Logging Configuration
+logging:
+  level: "INFO"                   # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_dir: "logs"
+  log_file: "stock_agent.log"
+  max_log_size: 10485760          # 10 MB
+  backup_count: 5
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Output Configuration
+output:
+  format: "yaml"                  # yaml, json, or both
+  output_dir: "outputs"
+  include_reasoning: true
+  include_alternatives: true
+  include_backtests: false
+
+# Database Configuration (Optional)
+database:
+  enabled: false
+  type: "sqlite"                  # sqlite or postgresql
+  path: "data/options_agent.db"
+
+  # For PostgreSQL
+  # host: "localhost"
+  # port: 5432
+  # user: "postgres"
+  # password: ""
+  # database: "options_agent"
+
+# Performance Configuration
+performance:
+  max_workers: 4                  # Thread pool size
+  cache_models: true
+  use_gpu: false
+
+# Testing Configuration
+testing:
+  backtesting_enabled: true
+  paper_trading: true
+  paper_trading_account: 100000   # Initial account size ($)
+
+# Feature Flags
+features:
+  technical_analysis: true
+  sentiment_analysis: true
+  ml_predictions: true
+  strategy_selection: true
+  position_sizing: true
+  risk_management: true
