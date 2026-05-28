@@ -1,0 +1,84 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 black isort mypy pylint bandit
+
+    - name: Check code formatting with black
+      run: |
+        black --check analyzer/ app.py config.py helpers.py validators.py --line-length=100
+      continue-on-error: true
+
+    - name: Check import sorting with isort
+      run: |
+        isort --check-only analyzer/ app.py config.py helpers.py validators.py
+      continue-on-error: true
+
+    - name: Lint with flake8
+      run: |
+        flake8 analyzer/ app.py config.py helpers.py validators.py \
+          --count --statistics \
+          --max-line-length=100 \
+          --extend-ignore=E203,W503 \
+          --exclude=.git,__pycache__,.pytest_cache
+      continue-on-error: true
+
+    - name: Security check with bandit
+      run: |
+        bandit -r analyzer/ app.py config.py helpers.py validators.py -f json -o bandit-report.json
+      continue-on-error: true
+
+    - name: Type check with mypy
+      run: |
+        mypy analyzer/ app.py \
+          --ignore-missing-imports \
+          --no-error-summary \
+          --warn-unused-configs
+      continue-on-error: true
+
+    - name: Archive quality reports
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: quality-reports
+        path: |
+          bandit-report.json
+        retention-days: 30
+
+  dependency-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Check for outdated dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pip-audit
+        pip-audit --desc
+      continue-on-error: true
+
+    - name: Check for security vulnerabilities
+      run: |
+        pip install safety
+        safety check --json
+      continue-on-error: true

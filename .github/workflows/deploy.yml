@@ -1,0 +1,84 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements_phase3b.txt
+
+    - name: Run tests before deployment
+      run: |
+        pip install pytest pytest-asyncio
+        pytest analyzer/ -v --tb=short
+
+    - name: Build Docker image
+      run: |
+        docker build -t options-trading-system:${{ github.sha }} \
+                     -t options-trading-system:latest .
+      continue-on-error: true
+
+    - name: Create deployment artifact
+      run: |
+        mkdir -p deployment
+        cp -r analyzer/ deployment/
+        cp app.py requirements_phase3b.txt deployment/
+        cp README_PHASE3B.md deployment/
+        zip -r deployment-${{ github.sha }}.zip deployment/
+
+    - name: Upload deployment artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-${{ github.sha }}
+        path: deployment-${{ github.sha }}.zip
+        retention-days: 90
+
+    - name: Create Release
+      if: success()
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: v-${{ github.sha }}
+        release_name: Release ${{ github.sha }}
+        body: |
+          Automated deployment of Options Trading System
+
+          **Changes in this Release:**
+          - Latest analyzer modules
+          - FastAPI backend
+          - All unit tests passing
+
+          **Version**: ${{ github.sha }}
+          **Date**: ${{ github.event.head_commit.timestamp }}
+        draft: false
+        prerelease: false
+
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "✅ Deployment successful!"
+        echo "Release: v-${{ github.sha }}"
+        echo "Artifact: deployment-${{ github.sha }}.zip"
+
+    - name: Notify deployment failure
+      if: failure()
+      run: |
+        echo "❌ Deployment failed!"
+        echo "Check logs for details"
+      continue-on-error: true

@@ -1,0 +1,141 @@
+version: '3.8'
+
+services:
+  # FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: options-trading-api
+    ports:
+      - "8000:8000"
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/trading_db
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: your-secret-key-change-in-production
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./analyzer:/app/analyzer:ro
+      - ./app.py:/app/app.py:ro
+      - logs:/app/logs
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: options-trading-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: trading_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: options-trading-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - trading_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Celery Worker (Phase 3C)
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: options-trading-celery
+    command: celery -A tasks worker --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: postgresql://postgres:postgres@db:5432/trading_db
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/trading_db
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./analyzer:/app/analyzer:ro
+      - ./tasks.py:/app/tasks.py:ro
+      - logs:/app/logs
+    networks:
+      - trading_network
+    profiles:
+      - celery
+
+  # Celery Beat (Phase 3C)
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: options-trading-beat
+    command: celery -A tasks beat --loglevel=info
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: postgresql://postgres:postgres@db:5432/trading_db
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/trading_db
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./analyzer:/app/analyzer:ro
+      - ./tasks.py:/app/tasks.py:ro
+      - logs:/app/logs
+    networks:
+      - trading_network
+    profiles:
+      - celery
+
+  # pgAdmin for Database Management (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: options-trading-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    networks:
+      - trading_network
+    profiles:
+      - admin
+
+volumes:
+  postgres_data:
+  redis_data:
+  logs:
+
+networks:
+  trading_network:
+    driver: bridge
