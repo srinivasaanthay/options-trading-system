@@ -22,6 +22,9 @@ COPY logger.py .
 COPY helpers.py .
 COPY validators.py .
 
+# Verify all imports resolve at build time
+RUN python -c "import app" && echo "Import check passed"
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
 
