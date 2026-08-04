@@ -27,7 +27,7 @@ import logging
 import os
 from fastapi import FastAPI, HTTPException, Depends, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthCredential
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
@@ -171,7 +171,7 @@ async def health_check():
 
 
 @app.get("/api/v1/status")
-async def system_status(credentials: HTTPAuthCredential = Depends(security)):
+async def system_status(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get system status and metrics"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -206,7 +206,7 @@ async def system_status(credentials: HTTPAuthCredential = Depends(security)):
 async def analyze_stock(
     symbol: str,
     price: float,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """
     Analyze stock and generate comprehensive trading recommendation.
@@ -317,7 +317,7 @@ async def analyze_stock(
 # ============================================================================
 
 @app.get("/api/v1/portfolio")
-async def get_portfolio(credentials: HTTPAuthCredential = Depends(security)):
+async def get_portfolio(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get user's portfolio positions"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -335,7 +335,7 @@ async def add_portfolio_position(
     symbol: str,
     quantity: int,
     entry_price: float,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Add position to portfolio"""
     if not credentials:
@@ -355,7 +355,7 @@ async def add_portfolio_position(
 # ============================================================================
 
 @app.get("/api/v1/watchlist")
-async def get_watchlist(credentials: HTTPAuthCredential = Depends(security)):
+async def get_watchlist(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get user's watchlist"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -371,7 +371,7 @@ async def get_watchlist(credentials: HTTPAuthCredential = Depends(security)):
 @app.post("/api/v1/watchlist/add/{symbol}")
 async def add_to_watchlist(
     symbol: str,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Add symbol to watchlist"""
     if not credentials:
@@ -389,7 +389,7 @@ async def add_to_watchlist(
 # ============================================================================
 
 @app.get("/api/v1/agent/status")
-async def agent_status(credentials: HTTPAuthCredential = Depends(security)):
+async def agent_status(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get MCP agent status"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -414,7 +414,7 @@ async def agent_status(credentials: HTTPAuthCredential = Depends(security)):
 async def agent_analyze(
     ticker: str,
     price: float,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Analyze ticker with buy signal"""
     if not credentials:
@@ -454,7 +454,7 @@ async def agent_analyze(
 
 
 @app.get("/api/v1/agent/watchlist")
-async def agent_get_watchlist(credentials: HTTPAuthCredential = Depends(security)):
+async def agent_get_watchlist(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get agent watchlist"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -470,7 +470,7 @@ async def agent_add_watchlist(
     ticker: str,
     buy_threshold: float = 0.70,
     max_position_size: float = 1000.0,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Add to agent watchlist"""
     if not credentials:
@@ -485,7 +485,7 @@ async def agent_add_watchlist(
 @app.get("/api/v1/agent/opportunities")
 async def agent_get_opportunities(
     min_score: float = 0.75,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Get buy opportunities"""
     if not credentials:
@@ -502,7 +502,7 @@ async def agent_send_notification(
     ticker: str,
     channels: List[str] = ["email"],
     recipients: List[str] = None,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Send notification"""
     if not credentials:
@@ -518,7 +518,7 @@ async def agent_send_notification(
 async def agent_get_history(
     ticker: str,
     days: int = 30,
-    credentials: HTTPAuthCredential = Depends(security)
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """Get analysis history"""
     if not credentials:
@@ -531,7 +531,7 @@ async def agent_get_history(
 
 
 @app.get("/api/v1/agent/performance")
-async def agent_performance(credentials: HTTPAuthCredential = Depends(security)):
+async def agent_performance(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get agent performance metrics"""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")

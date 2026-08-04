@@ -8,6 +8,8 @@ Integrates with existing analyzer framework.
 import asyncio
 import json
 import logging
+import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Tuple
@@ -105,6 +107,15 @@ class AnalysisResult:
     analysis_id: str = ""
     version: str = "1.0"
 
+    # Expert analysis signals (added for enhanced scoring)
+    iv_rank: float = 50.0           # 0-100: low = cheap options, high = expensive
+    volume_ratio: float = 1.0       # current vol / 20d avg vol
+    rs_vs_spy: float = 0.0          # 5d return relative to SPY (e.g. +2.0 = outperformed by 2%)
+    days_to_earnings: int = 999     # days until next earnings announcement
+    fundamental_score: float = 0.5  # 0-1 from analyst targets + short interest
+    analyst_upside: float = 0.0     # analyst consensus target vs current price (%)
+    short_interest_pct: float = 0.0 # short interest as % of float
+
 
 @dataclass
 class WatchlistItem:
@@ -165,6 +176,15 @@ class MCPStockAgent:
         self.analysis_history: Dict[str, List[AnalysisResult]] = {}
         self.notifications_sent: List[Dict] = []
 
+        # Real-data caches
+        self._ohlcv_cache: Dict[str, pd.DataFrame] = {}
+        self._market_cache: Dict = {}
+        self._market_cache_time: Optional[datetime] = None
+        self._options_cache: Dict[str, Tuple[Dict, datetime]] = {}
+        self._news_cache: Dict[str, Tuple[Dict, datetime]] = {}
+        self._earnings_cache: Dict[str, Tuple[int, datetime]] = {}    # ticker → (days_to_earn, fetched_at)
+        self._fundamental_cache: Dict[str, Tuple[Dict, datetime]] = {} # ticker → (data, fetched_at)
+
         logger.info("MCP Stock Agent initialized successfully")
 
     async def analyze_ticker(
@@ -185,15 +205,20 @@ class MCPStockAgent:
         logger.info(f"Analyzing {ticker} at ${price}")
 
         try:
-            # Prepare sample data for analyzers
-            news_data = self._generate_news_data()
-            technical_data = self._generate_technical_data()
-            options_data = self._generate_options_data()
-            market_data = self._generate_market_data()
+            # Prepare data for analyzers — all real yfinance-derived
+            news_data      = self._fetch_real_news_data(ticker)
+            technical_data = self._fetch_real_technical_data(ticker, price)
+            options_data   = self._fetch_real_options_data(ticker, price)
+            market_data    = self._fetch_real_market_data()
+            fundamental    = self._fetch_real_fundamental_data(ticker, price)
+            days_to_earn   = self._fetch_earnings_date(ticker)
 
             # Run all analyzers
-            news_sentiment = self.news_analyzer.analyze_sentiment(news_data)
-            technical_result = self.technical_analyzer.analyze(technical_data)
+            # news_data and technical_data are pre-formatted simulation dicts;
+            # pass them directly to the predictor rather than through analyzers
+            # that expect live API data.
+            news_sentiment = news_data
+            technical_result = technical_data
             market_analysis = self.market_analyzer.analyze_market(market_data)
             strategy_rec = self.strategy_selector.recommend_strategy(
                 market_analysis,
@@ -266,7 +291,15 @@ class MCPStockAgent:
                 key_factors=reasoning.get('supporting_analysis', []),
                 risks=self._identify_risks(technical_result, market_analysis),
                 targets=targets,
-                analysis_id=self._generate_id()
+                analysis_id=self._generate_id(),
+                # Expert analysis signals
+                iv_rank=options_data.get('iv_rank', 50.0),
+                volume_ratio=technical_data.get('volume_ratio', 1.0),
+                rs_vs_spy=technical_data.get('rs_vs_spy', 0.0),
+                days_to_earnings=days_to_earn,
+                fundamental_score=fundamental.get('fundamental_score', 0.5),
+                analyst_upside=fundamental.get('analyst_upside', 0.0),
+                short_interest_pct=fundamental.get('short_interest_pct', 0.0),
             )
 
             # Store in history
@@ -528,28 +561,543 @@ class MCPStockAgent:
 
         return risks or ["Market conditions normal"]
 
-    def _generate_news_data(self) -> Dict:
-        """Generate sample news data"""
+    # -----------------------------------------------------------------------
+    # Real data methods (yfinance-backed)
+    # -----------------------------------------------------------------------
+
+    def prefetch_ohlcv(self, tickers: List[str]) -> None:
+        """Batch-download 1-year daily OHLCV for all tickers and fill cache."""
+        try:
+            import yfinance as yf
+            chunk_size = 100
+            total_cached = 0
+            for i in range(0, len(tickers), chunk_size):
+                chunk = tickers[i:i + chunk_size]
+                try:
+                    raw = yf.download(
+                        chunk, period='1y', interval='1d',
+                        progress=False, auto_adjust=True
+                    )
+                    if raw.empty:
+                        continue
+                    for ticker in chunk:
+                        try:
+                            if isinstance(raw.columns, pd.MultiIndex):
+                                close = raw['Close'][ticker]
+                                high = raw['High'][ticker]
+                                low = raw['Low'][ticker]
+                                open_ = raw['Open'][ticker]
+                                vol = raw['Volume'][ticker]
+                            else:
+                                close = raw['Close']
+                                high = raw['High']
+                                low = raw['Low']
+                                open_ = raw['Open']
+                                vol = raw['Volume']
+                            df = pd.DataFrame({
+                                'close': close, 'high': high,
+                                'low': low, 'open': open_, 'volume': vol
+                            }).dropna(subset=['close'])
+                            if len(df) >= 20:
+                                self._ohlcv_cache[ticker] = df
+                                total_cached += 1
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.warning(f"[OHLCV] chunk {i} failed: {e}")
+            logger.info(f"[OHLCV] Prefetched {total_cached}/{len(tickers)} tickers")
+        except Exception as e:
+            logger.error(f"[OHLCV] prefetch_ohlcv failed: {e}")
+
+    def _get_ohlcv(self, ticker: str) -> Optional[pd.DataFrame]:
+        """Return cached OHLCV df; fetch individually if not cached."""
+        if ticker in self._ohlcv_cache:
+            return self._ohlcv_cache[ticker]
+        try:
+            import yfinance as yf
+            raw = yf.download(ticker, period='1y', interval='1d',
+                              progress=False, auto_adjust=True)
+            if raw.empty:
+                return None
+            df = raw.rename(columns={
+                'Close': 'close', 'High': 'high',
+                'Low': 'low', 'Open': 'open', 'Volume': 'volume'
+            })[['close', 'high', 'low', 'open', 'volume']].dropna(subset=['close'])
+            if len(df) >= 20:
+                self._ohlcv_cache[ticker] = df
+                return df
+        except Exception:
+            pass
+        return None
+
+    def _compute_indicators(self, df: Optional[pd.DataFrame]) -> Dict:
+        """Compute RSI, MACD, SMA, EMA from an OHLCV DataFrame."""
+        if df is None or len(df) < 20:
+            return {}
+        close = df['close'].astype(float)
+
+        # RSI-14
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi = float((100 - 100 / (1 + gain / (loss + 1e-10))).iloc[-1])
+
+        # MACD 12/26/9
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = float((macd_line - signal_line).iloc[-1])
+
+        # SMAs
+        sma20 = float(close.rolling(20).mean().iloc[-1]) if len(df) >= 20 else None
+        sma50 = float(close.rolling(50).mean().iloc[-1]) if len(df) >= 50 else None
+        sma200 = float(close.rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
+
+        # Price returns for sentiment proxy
+        ret5 = float((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6]) if len(df) >= 6 else 0.0
+        ret20 = float((close.iloc[-1] - close.iloc[-21]) / close.iloc[-21]) if len(df) >= 21 else ret5
+
         return {
-            'overall_sentiment': 0.3,
-            'strength': 0.7,
+            'rsi': rsi, 'macd_hist': macd_hist,
+            'sma20': sma20, 'sma50': sma50, 'sma200': sma200,
+            'ema12': float(ema12.iloc[-1]), 'ema26': float(ema26.iloc[-1]),
+            'ret5': ret5, 'ret20': ret20
+        }
+
+    def _fetch_real_technical_data(self, ticker: str, price: float) -> Dict:
+        """Compute technical indicators from real OHLCV data."""
+        df  = self._get_ohlcv(ticker)
+        ind = self._compute_indicators(df)
+        if not ind:
+            return self._generate_technical_data()
+
+        rsi = ind['rsi']
+        sma20, sma50, sma200 = ind.get('sma20'), ind.get('sma50'), ind.get('sma200')
+        macd_hist = ind['macd_hist']
+
+        # Trend: how many SMAs is price above?
+        above = sum(1 for s in [sma20, sma50, sma200] if s and price > s)
+        trend = 'uptrend' if above >= 2 else ('downtrend' if above == 0 else 'sideways')
+
+        # Momentum: MACD histogram, normalised to ±100
+        norm = (macd_hist / max(price, 1)) * 1000
+        momentum = max(-100.0, min(100.0, norm * 100))
+
+        # Strength: fraction of bullish indicators out of 5
+        bulls = sum([
+            bool(sma20 and price > sma20),
+            bool(sma50 and price > sma50),
+            bool(sma200 and price > sma200),
+            rsi < 70,
+            macd_hist > 0,
+        ])
+        strength = bulls / 5.0
+
+        # ── Volume confirmation ──────────────────────────────────────────────
+        volume_ratio = 1.0
+        if df is not None and 'volume' in df.columns and len(df) >= 20:
+            vol = df['volume'].astype(float)
+            avg_vol = float(vol.rolling(20).mean().iloc[-1])
+            cur_vol = float(vol.iloc[-1])
+            if avg_vol > 0:
+                volume_ratio = round(cur_vol / avg_vol, 2)
+
+        # ── Relative strength vs SPY ─────────────────────────────────────────
+        rs_vs_spy = 0.0
+        spy_df = self._ohlcv_cache.get('SPY')
+        if spy_df is not None and len(spy_df) >= 6:
+            spy_ret5 = float((spy_df['close'].iloc[-1] - spy_df['close'].iloc[-6]) /
+                             spy_df['close'].iloc[-6]) * 100
+            stock_ret5 = ind.get('ret5', 0.0) * 100
+            rs_vs_spy = round(stock_ret5 - spy_ret5, 2)
+
+        # Technical score 0–100
+        score = 50.0
+        if rsi < 30:    score += 15   # oversold → bullish
+        elif rsi < 50:  score += 5
+        elif rsi > 70:  score -= 15   # overbought → bearish
+        elif rsi > 60:  score -= 5
+        if sma20:
+            score += 10 if price > sma20 else -8
+        if sma50:
+            score += 10 if price > sma50 else -8
+        if sma200:
+            score += 8 if price > sma200 else -8
+        score += 9 if macd_hist > 0 else -9
+
+        # Volume bonus: above-average volume confirms the move (+5/-3)
+        if volume_ratio >= 1.5:
+            score += 5 if macd_hist > 0 else -3
+        elif volume_ratio < 0.5:
+            score -= 3  # thin volume weakens any signal
+
+        # Relative strength bonus: outperforming SPY by 2%+ is bullish
+        if rs_vs_spy >= 2.0:
+            score += 5
+        elif rs_vs_spy >= 1.0:
+            score += 3
+        elif rs_vs_spy <= -2.0:
+            score -= 5
+        elif rs_vs_spy <= -1.0:
+            score -= 3
+
+        score = max(0.0, min(100.0, score))
+
+        return {
+            'trend': trend,
+            'momentum': momentum,
+            'strength': strength,
+            'technical_score': score,
+            'rsi': rsi,
+            'macd_hist': macd_hist,
+            'volume_ratio': volume_ratio,
+            'rs_vs_spy': rs_vs_spy,
+            'support_resistance': {
+                'support': (sma20 or price) * 0.98,
+                'resistance': (sma20 or price) * 1.02
+            }
+        }
+
+    def _fetch_real_news_data(self, ticker: str) -> Dict:
+        """Score sentiment from real yfinance news headlines with keyword analysis."""
+        # Check cache (30-min TTL — news changes slowly)
+        now = datetime.utcnow()
+        if ticker in self._news_cache:
+            cached, fetched_at = self._news_cache[ticker]
+            if (now - fetched_at).total_seconds() < 1800:
+                return cached
+
+        # Strong, specific signals only — generic market words removed to avoid
+        # inflating sentiment from broad "stocks higher today" headlines.
+        BULLISH = {
+            'beat', 'beats', 'upgrade', 'upgraded', 'outperform',
+            'buy', 'bullish', 'breakthrough', 'milestone', 'record',
+            'profit', 'profits', 'soars', 'soared', 'surges', 'surged', 'surge',
+            'jumps', 'jumped', 'raises', 'raised', 'boosted', 'accelerates',
+            'expansion', 'rallies', 'rallied',
+        }
+        BEARISH = {
+            'miss', 'misses', 'missed', 'cut', 'cuts', 'downgrade', 'downgraded',
+            'layoff', 'layoffs', 'loss', 'losses', 'weak', 'disappoints', 'disappointed',
+            'warning', 'recall', 'investigation', 'fine', 'penalty',
+            'drops', 'dropped', 'bearish', 'sell', 'reduces', 'reduced',
+            'shrinks', 'slumps', 'slumped', 'slides', 'tumbles', 'tumbled',
+            'probe', 'lawsuit', 'bankruptcy', 'decline', 'declines',
+        }
+
+        # General-market openers — articles starting with these are index/macro news,
+        # not company news, and shouldn't affect per-ticker sentiment.
+        MARKET_OPENERS = {
+            'stocks', 's&p', 'dow', 'nasdaq', 'market', 'wall', 'futures',
+            'global', 'asian', 'european', 'fed', 'investors', 'treasury',
+        }
+
+        try:
+            import yfinance as yf
+            articles = yf.Ticker(ticker).news or []
+            if not articles:
+                raise ValueError("no articles")
+
+            bullish = bearish = 0
+            for article in articles[:15]:
+                # yfinance >= 0.2.x nests title inside content dict
+                content = article.get('content', {})
+                title = (content.get('title') or
+                         content.get('description') or
+                         article.get('title') or '')
+                if not title:
+                    continue
+                # Skip obvious macro/index headlines — they inflate all tickers equally.
+                parts = title.lower().split()
+                first_word = parts[0].strip('.,!?:;"\'') if parts else ''
+                if first_word in MARKET_OPENERS:
+                    continue
+                # Strip punctuation from each token before keyword matching
+                words = {w.strip('.,!?:;"\'') for w in parts}
+                bullish += len(words & BULLISH)
+                bearish += len(words & BEARISH)
+
+            total = bullish + bearish
+            if total == 0:
+                raise ValueError("no sentiment signals after market-article filter")
+
+            raw = (bullish - bearish) / total
+            sentiment = max(-1.0, min(1.0, raw * 2.0))
+            strength = min(1.0, total / 10.0 + 0.3)
+            trend = ('improving' if sentiment > 0.1
+                     else 'deteriorating' if sentiment < -0.1 else 'stable')
+
+            result = {
+                'overall_sentiment': sentiment,
+                'strength': strength,
+                'recency_score': 0.9,
+                'trend': trend,
+                'news_count': len(articles)
+            }
+            self._news_cache[ticker] = (result, now)
+            return result
+
+        except Exception:
+            # Fallback: price-momentum proxy when no news available
+            ind = self._compute_indicators(self._get_ohlcv(ticker))
+            if not ind:
+                return self._generate_news_data()
+            ret5  = ind.get('ret5',  0.0)
+            ret20 = ind.get('ret20', 0.0)
+            sentiment = max(-1.0, min(1.0, (ret5 * 0.6 + ret20 * 0.4) * 4.0))
+            trend = ('improving' if sentiment > 0.1
+                     else 'deteriorating' if sentiment < -0.1 else 'stable')
+            result = {
+                'overall_sentiment': sentiment,
+                'strength': min(1.0, abs(sentiment) * 0.8 + 0.2),
+                'recency_score': 0.6,
+                'trend': trend,
+                'news_count': 0
+            }
+            self._news_cache[ticker] = (result, now)
+            return result
+
+    def _fetch_real_market_data(self) -> Dict:
+        """Fetch SPY+VIX market regime data; cached for 30 minutes."""
+        now = datetime.utcnow()
+        if (self._market_cache_time and
+                (now - self._market_cache_time).total_seconds() < 1800):
+            return self._market_cache
+        try:
+            import yfinance as yf
+            raw = yf.download(['SPY', '^VIX'], period='1y', interval='1d',
+                              progress=False, auto_adjust=True)
+            spy = raw['Close']['SPY'].dropna()
+            vix_s = raw['Close']['^VIX'].dropna()
+            spy_price = float(spy.iloc[-1])
+            spy_sma50 = float(spy.rolling(50).mean().iloc[-1])
+            spy_sma200 = float(spy.rolling(200).mean().iloc[-1])
+            vix = float(vix_s.iloc[-1])
+
+            trend_dir = ('uptrend' if spy_price > spy_sma50 > spy_sma200
+                         else 'downtrend' if spy_price < spy_sma50
+                         else 'sideways')
+            vol_regime = ('low' if vix < 15 else
+                          'medium' if vix < 25 else
+                          'high' if vix < 40 else 'extreme')
+            health = 65.0
+            health += 20 if trend_dir == 'uptrend' else (-20 if trend_dir == 'downtrend' else 0)
+            health += 10 if vix < 15 else (-10 if vix > 30 else 0)
+            health = max(0.0, min(100.0, health))
+
+            result = {
+                'spy_price': spy_price,
+                'spy_sma50': spy_sma50,
+                'spy_sma200': spy_sma200,
+                'vix': vix,
+                'trend': {'direction': trend_dir},
+                'volatility': {'regime': vol_regime, 'vix': vix},
+                'health_score': health,
+                'breadth': {'breadth_score': 0.70 if trend_dir == 'uptrend' else 0.45}
+            }
+            self._market_cache = result
+            self._market_cache_time = now
+            logger.info(f"[Market] SPY={spy_price:.2f} VIX={vix:.1f} trend={trend_dir}")
+            return result
+        except Exception as e:
+            logger.error(f"[Market] fetch failed: {e}")
+            return self._generate_market_data()
+
+    def _fetch_real_options_data(self, ticker: str, price: float) -> Dict:
+        """Fetch real options chain: IV per strike, put/call ratio, ATM recommendations."""
+        # 20-min cache matches the analysis cycle
+        now = datetime.utcnow()
+        if ticker in self._options_cache:
+            cached, fetched_at = self._options_cache[ticker]
+            if (now - fetched_at).total_seconds() < 1200:
+                return cached
+
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker)
+            expirations = t.options
+            if not expirations:
+                raise ValueError("no options chain")
+
+            # Pick nearest expiry that is at least 7 days away
+            expiry = expirations[0]
+            for exp in expirations:
+                from datetime import date as _date
+                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                if (exp_date - _date.today()).days >= 7:
+                    expiry = exp
+                    break
+
+            chain = t.option_chain(expiry)
+            calls_df = chain.calls.copy()
+            puts_df  = chain.puts.copy()
+
+            # ATM window: ±10% of current price
+            lo, hi = price * 0.90, price * 1.10
+            atm_calls = calls_df[(calls_df['strike'] >= lo) & (calls_df['strike'] <= hi)]
+            atm_puts  = puts_df[ (puts_df['strike']  >= lo) & (puts_df['strike']  <= hi)]
+
+            call_iv = float(atm_calls['impliedVolatility'].mean()) if not atm_calls.empty else 0.25
+            put_iv  = float(atm_puts['impliedVolatility'].mean())  if not atm_puts.empty  else 0.25
+            call_iv = call_iv if np.isfinite(call_iv) and call_iv > 0 else 0.25
+            put_iv  = put_iv  if np.isfinite(put_iv)  and put_iv  > 0 else 0.25
+
+            # Put/call OI ratio — > 1 is bearish skew
+            call_oi = float(atm_calls['openInterest'].fillna(0).sum())
+            put_oi  = float(atm_puts['openInterest'].fillna(0).sum())
+            pc_ratio = put_oi / max(call_oi, 1)
+
+            def _top_recs(df, n=2):
+                if df.empty:
+                    return []
+                top = df.nlargest(n, 'volume') if 'volume' in df.columns else df.head(n)
+                recs = []
+                for _, row in top.iterrows():
+                    iv = float(row.get('impliedVolatility', 0.25))
+                    iv = iv if np.isfinite(iv) and iv > 0 else 0.25
+                    recs.append({
+                        'strike': float(row['strike']),
+                        'suitability': {'option_score': min(95, int(iv * 150 + 40))}
+                    })
+                return recs
+
+            # ── IV Rank (proxy via realized vol comparison) ──────────────────
+            # Compare ATM implied vol to 20-day historical vol.
+            # IV/HV ratio > 2 = expensive options (rank ~100), < 0.7 = cheap (rank ~0).
+            iv_rank = 50.0
+            hv_df = self._ohlcv_cache.get(ticker)
+            if hv_df is not None and len(hv_df) >= 21:
+                log_ret = np.log(hv_df['close'].astype(float) / hv_df['close'].astype(float).shift(1)).dropna()
+                hv20 = float(log_ret.tail(20).std() * np.sqrt(252))
+                if hv20 > 0:
+                    iv_hv_ratio = call_iv / hv20
+                    # ratio 0.7 → rank 0, ratio 1.0 → rank 33, ratio 2.0 → rank 100
+                    iv_rank = round(min(100.0, max(0.0, (iv_hv_ratio - 0.7) / 1.3 * 100)), 1)
+
+            result = {
+                'calls': {
+                    'recommendations': _top_recs(atm_calls) or [{'strike': round(price * 1.05), 'suitability': {'option_score': 60}}],
+                    'avg_iv': call_iv
+                },
+                'puts': {
+                    'recommendations': _top_recs(atm_puts) or [{'strike': round(price * 0.95), 'suitability': {'option_score': 55}}],
+                    'avg_iv': put_iv
+                },
+                'pc_ratio': pc_ratio,
+                'iv_rank': iv_rank,
+            }
+            self._options_cache[ticker] = (result, now)
+            logger.debug(f"[Options] {ticker} call_iv={call_iv:.2f} put_iv={put_iv:.2f} pc={pc_ratio:.2f}")
+            return result
+
+        except Exception as e:
+            logger.debug(f"[Options] {ticker} fetch failed: {e}")
+            return self._generate_options_data()
+
+    # -----------------------------------------------------------------------
+    # Expert signals: earnings date + fundamental data
+    # -----------------------------------------------------------------------
+
+    def _fetch_earnings_date(self, ticker: str) -> int:
+        """Return days until next earnings announcement (999 = unknown/far out). 24h cache."""
+        now = datetime.utcnow()
+        if ticker in self._earnings_cache:
+            cached_days, fetched_at = self._earnings_cache[ticker]
+            if (now - fetched_at).total_seconds() < 86400:
+                return cached_days
+        days = 999
+        try:
+            import yfinance as yf
+            from datetime import date as _date
+            cal = yf.Ticker(ticker).calendar
+            if cal is not None and not (hasattr(cal, 'empty') and cal.empty):
+                # Newer yfinance: dict with 'Earnings Date' key
+                if isinstance(cal, dict):
+                    earn = cal.get('Earnings Date')
+                    if earn:
+                        earn_dt = earn[0] if isinstance(earn, list) else earn
+                        if hasattr(earn_dt, 'date'):
+                            days = max(0, (earn_dt.date() - _date.today()).days)
+                # Older yfinance: DataFrame with 'Earnings Date' row
+                elif hasattr(cal, 'loc'):
+                    if 'Earnings Date' in cal.index:
+                        val = cal.loc['Earnings Date'].iloc[0]
+                        if hasattr(val, 'date'):
+                            days = max(0, (val.date() - _date.today()).days)
+        except Exception:
+            pass
+        self._earnings_cache[ticker] = (days, now)
+        return days
+
+    def _fetch_real_fundamental_data(self, ticker: str, price: float) -> Dict:
+        """Fetch analyst price targets and short interest. 4-hour cache."""
+        now = datetime.utcnow()
+        if ticker in self._fundamental_cache:
+            cached, fetched_at = self._fundamental_cache[ticker]
+            if (now - fetched_at).total_seconds() < 14400:
+                return cached
+
+        result = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
+                  'analyst_count': 0,    'fundamental_score': 0.5}
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info
+            target      = float(info.get('targetMeanPrice') or 0)
+            n_analysts  = int(info.get('numberOfAnalystOpinions') or 0)
+            short_float = float(info.get('shortPercentOfFloat') or 0)
+
+            upside = ((target - price) / price * 100) if target > 0 and price > 0 else 0.0
+
+            # upside score: 0%→0.3, 10%→0.6, 25%+→1.0
+            upside_score = min(1.0, max(0.0, 0.3 + upside / 35.0))
+            # short squeeze score: >15% float short with positive catalyst → bullish
+            short_score = min(1.0, short_float / 0.15) if short_float > 0 else 0.3
+
+            # Only trust consensus if ≥3 analysts cover the stock
+            if n_analysts >= 3:
+                fund_score = round(upside_score * 0.75 + short_score * 0.25, 4)
+            else:
+                fund_score = 0.5  # neutral when no coverage
+
+            result = {
+                'analyst_upside':    round(upside, 1),
+                'short_interest_pct': round(short_float * 100, 1),
+                'analyst_count':     n_analysts,
+                'fundamental_score': fund_score,
+            }
+        except Exception as e:
+            logger.debug("[Fundamentals] %s failed: %s", ticker, e)
+
+        self._fundamental_cache[ticker] = (result, now)
+        return result
+
+    # -----------------------------------------------------------------------
+    # Fallback generators (used when yfinance data is unavailable)
+    # -----------------------------------------------------------------------
+
+    def _generate_news_data(self) -> Dict:
+        """Fallback: neutral news data"""
+        return {
+            'overall_sentiment': 0.1,
+            'strength': 0.5,
             'recency_score': 0.8,
-            'trend': 'improving',
+            'trend': 'stable',
             'news_count': 5
         }
 
     def _generate_technical_data(self) -> Dict:
-        """Generate sample technical data"""
+        """Fallback: neutral technical data"""
         return {
-            'trend': 'uptrend',
-            'momentum': 45,
-            'strength': 0.75,
-            'technical_score': 65,
+            'trend': 'sideways',
+            'momentum': 0,
+            'strength': 0.5,
+            'technical_score': 50,
             'support_resistance': {'support': 95, 'resistance': 105}
         }
 
     def _generate_options_data(self) -> Dict:
-        """Generate sample options data"""
+        """Generate options IV data"""
         return {
             'calls': {
                 'recommendations': [
@@ -568,12 +1116,16 @@ class MCPStockAgent:
         }
 
     def _generate_market_data(self) -> Dict:
-        """Generate sample market data"""
+        """Fallback: neutral market data"""
         return {
-            'trend': {'direction': 'uptrend'},
-            'volatility': {'regime': 'medium', 'vix': 18},
-            'health_score': 70,
-            'breadth': {'breadth_score': 0.75}
+            'spy_price': 500.0,
+            'spy_sma50': 490.0,
+            'spy_sma200': 470.0,
+            'vix': 20.0,
+            'trend': {'direction': 'sideways'},
+            'volatility': {'regime': 'medium', 'vix': 20},
+            'health_score': 65,
+            'breadth': {'breadth_score': 0.55}
         }
 
     def _generate_id(self) -> str:
