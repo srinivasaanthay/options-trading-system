@@ -81,3 +81,4 @@ temp/
 keys/
 secrets/
 credentials.json
+alpaca.env

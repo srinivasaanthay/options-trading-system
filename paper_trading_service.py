@@ -1,0 +1,570 @@
+"""
+Paper Trading Service — Alpaca Paper API integration (Real Options)
+
+Buys actual options contracts based on SP500 signals:
+  CALL signal → BUY a CALL option on the underlying (ATM, ~30-day expiry)
+  PUT  signal → BUY a PUT option on the underlying  (ATM, ~30-day expiry)
+
+Position sizing: 1 contract per signal (~$500 notional in premium)
+Exit strategy: sell the contract when the underlying hits 5% take-profit
+  or 3% stop-loss vs. the entry price, or after 24 hours.
+"""
+
+import logging
+from datetime import datetime, timedelta, timezone, date
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TradeRecord:
+    ticker: str
+    direction: str          # "LONG" (call bought) or "SHORT" (put bought)
+    qty: float              # number of contracts
+    entry_price: float      # underlying price at signal time
+    entry_time: str
+    stop_loss: float        # underlying price level
+    take_profit: float      # underlying price level
+    signal_score: float
+    signal_source: str      # "CALL" or "PUT"
+
+    # Options contract info
+    option_symbol: Optional[str] = None
+    option_strike: Optional[float] = None
+    option_expiry: Optional[str] = None
+
+    entry_intraday_move: float = 0.0  # % move of underlying at entry (detects chased entries)
+    entry_hour_et: int = -1           # ET hour of entry (detects out-of-window entries)
+
+    # Filled after close
+    exit_price: Optional[float] = None
+    exit_time: Optional[str] = None
+    pnl: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    status: str = "open"    # "open" | "closed" | "error"
+    alpaca_order_id: Optional[str] = None
+    notes: str = ""
+
+
+@dataclass
+class PortfolioSnapshot:
+    timestamp: str
+    cash: float
+    portfolio_value: float
+    equity: float
+    unrealized_pnl: float
+    realized_pnl: float
+    total_return_pct: float
+    open_positions: int
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+
+
+class PaperTradingService:
+    """
+    Manages options paper-trading execution against Alpaca's Paper API.
+
+    Usage:
+        service = PaperTradingService(api_key, api_secret)
+        service.connect()
+        service.execute_signals(recs)   # call after each SP500 analysis
+    """
+
+    STARTING_CAPITAL    = 100_000.0
+    MAX_OPEN_POSITIONS  = 8
+    HOLD_HOURS          = 24
+    STOP_LOSS_PCT       = 0.03      # close if underlying moves 3% against us
+    TAKE_PROFIT_PCT     = 0.05      # close if underlying moves 5% in our favour
+    MIN_SIGNAL_SCORE    = 0.70
+    COOLDOWN_HOURS      = 6
+    MIN_EXPIRY_DAYS     = 25        # minimum days to expiry when entering
+    MAX_EXPIRY_DAYS     = 50        # maximum days to expiry when entering
+
+    def __init__(self, api_key: str, api_secret: str):
+        self.api_key    = api_key
+        self.api_secret = api_secret
+        self.client     = None
+        self.data_client = None
+        self.connected  = False
+
+        self.trade_history: List[TradeRecord] = []
+        self._last_traded: Dict[str, datetime] = {}
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    def connect(self) -> bool:
+        try:
+            from alpaca.trading.client import TradingClient
+            from alpaca.data.historical import StockHistoricalDataClient
+
+            self.client = TradingClient(self.api_key, self.api_secret, paper=True)
+            self.data_client = StockHistoricalDataClient(self.api_key, self.api_secret)
+            account = self.client.get_account()
+            logger.info("[PaperTrading] Connected — equity=$%.2f cash=$%.2f",
+                        float(account.equity), float(account.cash))
+            self.connected = True
+            return True
+        except Exception as e:
+            logger.error("[PaperTrading] Connection failed: %s", e)
+            self.connected = False
+            return False
+
+    # ── Account / portfolio ────────────────────────────────────────────────────
+
+    def get_account(self) -> Optional[Dict]:
+        if not self.connected:
+            return None
+        try:
+            acc = self.client.get_account()
+            equity    = float(acc.equity)
+            last_eq   = float(acc.last_equity) if hasattr(acc, "last_equity") and acc.last_equity else equity
+            unreal_pl = equity - last_eq
+            unreal_pct = (unreal_pl / last_eq * 100) if last_eq else 0.0
+            return {
+                "equity":          equity,
+                "cash":            float(acc.cash),
+                "buying_power":    float(acc.buying_power),
+                "portfolio_value": float(acc.portfolio_value),
+                "unrealized_pl":   unreal_pl,
+                "unrealized_plpc": unreal_pct,
+                "status": acc.status.value if hasattr(acc.status, "value") else str(acc.status),
+            }
+        except Exception as e:
+            logger.error("[PaperTrading] get_account failed: %s", e)
+            return None
+
+    def get_positions(self) -> List[Dict]:
+        if not self.connected:
+            return []
+        try:
+            positions = self.client.get_all_positions()
+            result = []
+            for p in positions:
+                d = {
+                    "symbol":        p.symbol,
+                    "qty":           float(p.qty),
+                    "side":          p.side.value,
+                    "market_value":  float(p.market_value),
+                    "unrealized_pnl": float(p.unrealized_pl),
+                    "unrealized_pnl_pct": float(p.unrealized_plpc) * 100,
+                    "change_today":  float(p.change_today) * 100,
+                }
+                # For options positions include extra fields where available
+                if hasattr(p, 'avg_entry_price'):
+                    d["entry_price"] = float(p.avg_entry_price)
+                if hasattr(p, 'current_price'):
+                    d["current_price"] = float(p.current_price)
+                result.append(d)
+            return result
+        except Exception as e:
+            logger.error("[PaperTrading] get_positions failed: %s", e)
+            return []
+
+    def get_recent_orders(self, limit: int = 20) -> List[Dict]:
+        if not self.connected:
+            return []
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
+            orders = self.client.get_orders(req)
+            return [
+                {
+                    "id":         str(o.id),
+                    "symbol":     o.symbol,
+                    "side":       o.side.value,
+                    "qty":        float(o.qty or 0),
+                    "filled_qty": float(o.filled_qty or 0),
+                    "status":     o.status.value,
+                    "filled_at":  o.filled_at.isoformat() if o.filled_at else None,
+                    "filled_avg_price": float(o.filled_avg_price or 0),
+                }
+                for o in orders
+            ]
+        except Exception as e:
+            logger.error("[PaperTrading] get_recent_orders failed: %s", e)
+            return []
+
+    def get_portfolio_snapshot(self) -> PortfolioSnapshot:
+        acc = self.get_account() or {}
+        equity        = acc.get("equity",          self.STARTING_CAPITAL)
+        cash          = acc.get("cash",             self.STARTING_CAPITAL)
+        portfolio_val = acc.get("portfolio_value",  self.STARTING_CAPITAL)
+        unrealized    = acc.get("unrealized_pl",    0.0)
+
+        closed = [t for t in self.trade_history if t.status == "closed" and t.pnl is not None]
+        realized  = sum(t.pnl for t in closed)
+        winning   = [t for t in closed if (t.pnl or 0) > 0]
+        losing    = [t for t in closed if (t.pnl or 0) <= 0]
+        total_ret = ((portfolio_val - self.STARTING_CAPITAL) / self.STARTING_CAPITAL) * 100
+
+        return PortfolioSnapshot(
+            timestamp        = datetime.utcnow().isoformat(),
+            cash             = cash,
+            portfolio_value  = portfolio_val,
+            equity           = equity,
+            unrealized_pnl   = unrealized,
+            realized_pnl     = realized,
+            total_return_pct = round(total_ret, 2),
+            open_positions   = len(self.get_positions()),
+            total_trades     = len(closed),
+            winning_trades   = len(winning),
+            losing_trades    = len(losing),
+            win_rate         = round(len(winning) / len(closed) * 100, 1) if closed else 0.0,
+        )
+
+    def get_trade_history(self) -> List[Dict]:
+        return [asdict(t) for t in self.trade_history]
+
+    # ── Signal execution ───────────────────────────────────────────────────────
+
+    def execute_signals(self, recommendations: List[Dict]) -> List[Dict]:
+        if not self.connected:
+            logger.warning("[PaperTrading] Not connected — skipping execution")
+            return []
+
+        eligible = [r for r in recommendations if r.get("score", 0) >= self.MIN_SIGNAL_SCORE]
+        if not eligible:
+            logger.info("[PaperTrading] No signals above threshold %.2f", self.MIN_SIGNAL_SCORE)
+            return []
+
+        open_count = len(self.get_positions())
+        slots = self.MAX_OPEN_POSITIONS - open_count
+        if slots <= 0:
+            logger.info("[PaperTrading] Max positions reached (%d)", self.MAX_OPEN_POSITIONS)
+            return []
+
+        calls = sorted([r for r in eligible if r.get("action") == "CALL"], key=lambda x: -x["score"])
+        puts  = sorted([r for r in eligible if r.get("action") == "PUT"],  key=lambda x: -x["score"])
+
+        candidates: List[Dict] = []
+        while (calls or puts) and len(candidates) < slots:
+            if calls: candidates.append(calls.pop(0))
+            if puts and len(candidates) < slots:
+                candidates.append(puts.pop(0))
+
+        results = []
+        for rec in candidates:
+            ticker = rec.get("ticker", "")
+            action = rec.get("action", "CALL")
+            price  = float(rec.get("current_price", 0))
+            score  = float(rec.get("score", 0))
+
+            if price <= 0 or self._is_in_cooldown(ticker):
+                continue
+
+            # Fix #2: skip if underlying already moved >2.5% intraday (chasing)
+            intraday_move = self._get_intraday_move(ticker)
+            if abs(intraday_move) > 0.025:
+                logger.info(
+                    "[PaperTrading] Skipping %s — already moved %.1f%% today",
+                    ticker, intraday_move * 100
+                )
+                continue
+
+            result = self._place_option_order(ticker, action, price, score)
+            if result:
+                results.append(result)
+                self._last_traded[ticker] = datetime.utcnow()
+
+        self._close_expired_positions()
+        logger.info("[PaperTrading] Executed %d option trades this cycle", len(results))
+        return results
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _find_option_contract(self, ticker: str, action: str, price: float) -> Optional[object]:
+        """Find the most liquid ATM option contract expiring in MIN_EXPIRY_DAYS–MAX_EXPIRY_DAYS."""
+        try:
+            from alpaca.trading.requests import GetOptionContractsRequest
+            from alpaca.trading.enums import ContractType
+
+            c_type = ContractType.CALL if action == "CALL" else ContractType.PUT
+            today  = date.today()
+
+            # Two search passes: tight ±3% then wider ±8%
+            for strike_pct in (0.03, 0.08):
+                req = GetOptionContractsRequest(
+                    underlying_symbols=[ticker],
+                    expiration_date_gte=today + timedelta(days=self.MIN_EXPIRY_DAYS),
+                    expiration_date_lte=today + timedelta(days=self.MAX_EXPIRY_DAYS),
+                    type=c_type,
+                    strike_price_gte=str(round(price * (1 - strike_pct), 2)),
+                    strike_price_lte=str(round(price * (1 + strike_pct), 2)),
+                )
+                resp = self.client.get_option_contracts(req)
+                contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
+                if not contracts:
+                    continue
+
+                # Prefer liquid contracts (have open interest), fall back to all
+                liquid = [c for c in contracts if c.open_interest and int(c.open_interest) > 0]
+                pool   = liquid if liquid else contracts
+
+                # Sort: nearest expiry, then closest strike to ATM
+                return min(pool, key=lambda c: (
+                    c.expiration_date,
+                    abs(float(c.strike_price) - price)
+                ))
+            return None
+        except Exception as e:
+            logger.error("[PaperTrading] _find_option_contract %s %s: %s", action, ticker, e)
+            return None
+
+    def _place_option_order(
+        self, ticker: str, action: str, price: float, score: float
+    ) -> Optional[Dict]:
+        """Buy 1 options contract (CALL or PUT) closest to ATM using limit order at mid-price."""
+        try:
+            contract = self._find_option_contract(ticker, action, price)
+            if not contract:
+                logger.warning("[PaperTrading] No %s contract found for %s", action, ticker)
+                return None
+
+            from alpaca.trading.requests import LimitOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            # Fix #1: use limit order at mid-price to avoid paying full ask spread
+            limit_price = None
+            try:
+                data_client = OptionHistoricalDataClient(self.api_key, self.api_secret)
+                quotes = data_client.get_option_latest_quote(
+                    OptionLatestQuoteRequest(symbol_or_symbols=contract.symbol)
+                )
+                q = quotes.get(contract.symbol)
+                if q and float(q.bid_price) > 0 and float(q.ask_price) > 0:
+                    mid = round((float(q.bid_price) + float(q.ask_price)) / 2, 2)
+                    limit_price = max(mid, 0.01)
+            except Exception as qe:
+                logger.warning("[PaperTrading] Quote fetch failed for %s: %s — using market", contract.symbol, qe)
+
+            if limit_price:
+                order_req = LimitOrderRequest(
+                    symbol=contract.symbol,
+                    qty=1,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price,
+                )
+                logger.info("[PaperTrading] Limit order at $%.2f (mid) for %s", limit_price, contract.symbol)
+            else:
+                from alpaca.trading.requests import MarketOrderRequest
+                order_req = MarketOrderRequest(
+                    symbol=contract.symbol,
+                    qty=1,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+            order = self.client.submit_order(order_req)
+
+            direction   = "LONG" if action == "CALL" else "SHORT"
+            stop_loss   = price * (1 - self.STOP_LOSS_PCT)   if action == "CALL" else price * (1 + self.STOP_LOSS_PCT)
+            take_profit = price * (1 + self.TAKE_PROFIT_PCT) if action == "CALL" else price * (1 - self.TAKE_PROFIT_PCT)
+            strike      = float(contract.strike_price)
+
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            trade = TradeRecord(
+                ticker               = ticker,
+                direction            = direction,
+                qty                  = 1.0,
+                entry_price          = price,
+                entry_time           = datetime.utcnow().isoformat(),
+                stop_loss            = round(stop_loss, 4),
+                take_profit          = round(take_profit, 4),
+                signal_score         = score,
+                signal_source        = action,
+                option_symbol        = contract.symbol,
+                option_strike        = strike,
+                option_expiry        = str(contract.expiration_date),
+                alpaca_order_id      = str(order.id),
+                status               = "open",
+                entry_intraday_move  = round(self._get_intraday_move(ticker) * 100, 2),
+                entry_hour_et        = now_et.hour,
+            )
+            self.trade_history.append(trade)
+
+            logger.info(
+                "[PaperTrading] BUY %s %s | contract=%s strike=$%.2f expiry=%s score=%.3f",
+                action, ticker, contract.symbol, strike, contract.expiration_date, score,
+            )
+            return {
+                "ticker":           ticker,
+                "action":           action,
+                "option_symbol":    contract.symbol,
+                "option_strike":    strike,
+                "option_expiry":    str(contract.expiration_date),
+                "underlying_price": price,
+                "score":            score,
+                "order_id":         str(order.id),
+                "status":           "submitted",
+            }
+
+        except Exception as e:
+            logger.error("[PaperTrading] Option order failed for %s %s: %s", action, ticker, e)
+            self.trade_history.append(TradeRecord(
+                ticker=ticker,
+                direction="LONG" if action == "CALL" else "SHORT",
+                qty=0, entry_price=price, entry_time=datetime.utcnow().isoformat(),
+                stop_loss=0, take_profit=0, signal_score=score, signal_source=action,
+                status="error", notes=str(e),
+            ))
+            return None
+
+    def _close_expired_positions(self) -> None:
+        """Sell any options positions that have hit stop/take-profit or exceeded HOLD_HOURS."""
+        if not self.connected:
+            return
+        try:
+            import yfinance as yf
+            open_trades = [t for t in self.trade_history if t.status == "open" and t.option_symbol]
+            now = datetime.now(timezone.utc)
+
+            for trade in open_trades:
+                # Age check
+                entry_dt = datetime.fromisoformat(trade.entry_time.replace("Z", "+00:00"))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                age_hours = (now - entry_dt).total_seconds() / 3600
+
+                # Get current underlying price
+                try:
+                    fi = yf.Ticker(trade.ticker).fast_info
+                    current = float(getattr(fi, 'last_price', 0) or trade.entry_price)
+                except Exception:
+                    current = trade.entry_price
+
+                hit_stop   = (trade.direction == "LONG"  and current <= trade.stop_loss) or \
+                             (trade.direction == "SHORT" and current >= trade.stop_loss)
+                hit_target = (trade.direction == "LONG"  and current >= trade.take_profit) or \
+                             (trade.direction == "SHORT" and current <= trade.take_profit)
+
+                if age_hours >= self.HOLD_HOURS or hit_stop or hit_target:
+                    reason = ("expired"      if age_hours >= self.HOLD_HOURS
+                              else "stop_loss"  if hit_stop
+                              else "take_profit")
+                    self._close_option_position(trade, current, reason)
+
+        except Exception as e:
+            logger.error("[PaperTrading] _close_expired_positions failed: %s", e)
+
+    def _close_option_position(self, trade: TradeRecord, current_price: float, reason: str) -> None:
+        """Sell an options contract and record the trade outcome."""
+        try:
+            self.client.close_position(trade.option_symbol)
+
+            entry = trade.entry_price
+            if trade.direction == "LONG":
+                pnl_pct = ((current_price - entry) / entry) * 100
+            else:
+                pnl_pct = ((entry - current_price) / entry) * 100
+
+            # Approximate dollar P&L: ATM option has ~0.5 delta, so option moves ~50% of underlying
+            pnl = pnl_pct / 100 * 500 * 0.5
+
+            trade.exit_price = current_price
+            trade.exit_time  = datetime.utcnow().isoformat()
+            trade.pnl        = round(pnl, 4)
+            trade.pnl_pct    = round(pnl_pct, 2)
+            trade.status     = "closed"
+            trade.notes      = reason
+
+            logger.info(
+                "[PaperTrading] Closed %s %s %s @ underlying=$%.2f (%.2f%%) reason=%s",
+                trade.direction, trade.ticker, trade.option_symbol,
+                current_price, pnl_pct, reason,
+            )
+        except Exception as e:
+            logger.error("[PaperTrading] Close failed for %s: %s", trade.option_symbol, e)
+
+    def close_rule_violating_positions(self) -> List[Dict]:
+        """Close only positions that violated current entry rules:
+        - entered when underlying already moved >2.5% intraday (chasing)
+        - entered outside the 10:00–15:30 ET window
+        - unknown entries (entry_hour_et == -1, i.e. placed before tracking was added)
+        Returns list of closed position details.
+        """
+        if not self.connected:
+            return []
+
+        closed = []
+        open_trades = [t for t in self.trade_history if t.status == "open" and t.option_symbol]
+
+        for trade in open_trades:
+            reason = None
+            if trade.entry_hour_et == -1:
+                reason = "pre-fix entry (tracking unavailable)"
+            elif abs(trade.entry_intraday_move) > 2.5:
+                reason = f"chased entry ({trade.entry_intraday_move:+.1f}% move at entry)"
+            elif not (10 <= trade.entry_hour_et < 15 or (trade.entry_hour_et == 15 and 0 <= 30)):
+                reason = f"outside trading window (entered {trade.entry_hour_et}:xx ET)"
+
+            if reason:
+                try:
+                    self.client.close_position(trade.option_symbol)
+                    trade.status = "closed"
+                    trade.notes  = f"rule-violation close: {reason}"
+                    closed.append({"ticker": trade.ticker, "symbol": trade.option_symbol, "reason": reason})
+                    logger.info("[PaperTrading] Closed rule-violating %s — %s", trade.option_symbol, reason)
+                except Exception as e:
+                    logger.error("[PaperTrading] Could not close %s: %s", trade.option_symbol, e)
+
+        # Also close any Alpaca positions not tracked in trade_history (legacy positions)
+        try:
+            tracked_symbols = {t.option_symbol for t in self.trade_history}
+            all_positions = self.client.get_all_positions()
+            for p in all_positions:
+                if p.symbol not in tracked_symbols:
+                    try:
+                        self.client.close_position(p.symbol)
+                        closed.append({"ticker": p.symbol[:4], "symbol": p.symbol, "reason": "legacy untracked position"})
+                        logger.info("[PaperTrading] Closed legacy position %s", p.symbol)
+                    except Exception as e:
+                        logger.error("[PaperTrading] Could not close legacy %s: %s", p.symbol, e)
+        except Exception as e:
+            logger.error("[PaperTrading] Legacy position scan failed: %s", e)
+
+        return closed
+
+    def close_all_open_positions(self) -> int:
+        """Close every open Alpaca position. Returns number closed."""
+        if not self.connected:
+            return 0
+        closed = 0
+        try:
+            positions = self.client.get_all_positions()
+            for p in positions:
+                try:
+                    self.client.close_position(p.symbol)
+                    closed += 1
+                    logger.info("[PaperTrading] Force-closed %s", p.symbol)
+                except Exception as e:
+                    logger.error("[PaperTrading] Could not close %s: %s", p.symbol, e)
+        except Exception as e:
+            logger.error("[PaperTrading] close_all_open_positions failed: %s", e)
+        return closed
+
+    def _is_in_cooldown(self, ticker: str) -> bool:
+        last = self._last_traded.get(ticker)
+        if last is None:
+            return False
+        return (datetime.utcnow() - last).total_seconds() < self.COOLDOWN_HOURS * 3600
+
+    def _get_intraday_move(self, ticker: str) -> float:
+        """Return today's intraday move as a fraction (e.g. 0.05 = +5%). Returns 0.0 on failure."""
+        try:
+            import yfinance as yf
+            fi = yf.Ticker(ticker).fast_info
+            open_price = getattr(fi, 'open', None) or getattr(fi, 'regular_market_open', None)
+            last_price = getattr(fi, 'last_price', None)
+            if open_price and last_price and open_price > 0:
+                return (last_price - open_price) / open_price
+        except Exception:
+            pass
+        return 0.0
