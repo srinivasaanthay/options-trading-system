@@ -509,7 +509,9 @@ async def lifespan(app: FastAPI):
             ok = await loop.run_in_executor(None, paper_trader.connect)
             logger.info("✅ Paper trader %s", "connected" if ok else "FAILED")
 
-        await _sp500_scheduler_loop()
+        # Only run local SP500 scanner if not in push mode (Railway uses push-results endpoint)
+        if not os.getenv("PUSH_MODE"):
+            await _sp500_scheduler_loop()
 
     sp500_task = asyncio.create_task(_init_all())
     logger.info("System initializing in background — server ready")
@@ -651,6 +653,50 @@ async def get_sp500_history(
         "count": len(hourly_snapshots),
         "snapshots": hourly_snapshots,
     }
+
+
+@app.post("/api/v1/sp500/push-results")
+async def push_sp500_results(
+    payload: dict,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Receive pre-computed SP500 results pushed from local machine."""
+    global latest_options_recs, last_sp500_run
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    recs_data = payload.get("recommendations", [])
+    recs = []
+    for r in recs_data:
+        try:
+            recs.append(OptionsRecommendation(
+                ticker=r["ticker"],
+                action=r["action"],
+                strike_price=r["strike_price"],
+                expiry_date=r["expiry_date"],
+                score=r["score"],
+                confidence=r.get("confidence", "HIGH"),
+                current_price=r.get("current_price", 0.0),
+                buy_signal=r.get("buy_signal", "BUY"),
+                technical_score=r.get("technical_score", 0.0),
+                sentiment_score=r.get("sentiment_score", 0.0),
+                ml_score=r.get("ml_score", 0.0),
+                timestamp=r.get("timestamp", datetime.utcnow().isoformat()),
+                thesis=r.get("thesis", ""),
+                days_to_expiry=r.get("days_to_expiry", 30),
+                iv_rank=r.get("iv_rank", 50.0),
+                volume_ratio=r.get("volume_ratio", 1.0),
+                rs_vs_spy=r.get("rs_vs_spy", 0.0),
+                days_to_earnings=r.get("days_to_earnings", 999),
+                analyst_upside=r.get("analyst_upside", 0.0),
+            ))
+        except Exception as e:
+            logger.warning(f"Skipping bad rec: {e}")
+
+    latest_options_recs = sorted(recs, key=lambda x: x.score, reverse=True)
+    last_sp500_run = datetime.utcnow()
+    logger.info(f"[push-results] Received {len(latest_options_recs)} recommendations from local runner")
+    return {"received": len(latest_options_recs), "timestamp": last_sp500_run.isoformat()}
 
 
 @app.post("/api/v1/sp500/trigger-analysis")
