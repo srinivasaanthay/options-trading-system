@@ -322,6 +322,14 @@ def _load_results():
         import json as _json
         with open(_RESULTS_FILE) as f:
             data = _json.load(f)
+        # Don't load stale data from a previous trading day
+        if data.get("last_run"):
+            saved_dt = datetime.fromisoformat(data["last_run"])
+            saved_date = saved_dt.astimezone(ZoneInfo("America/New_York")).date()
+            today = datetime.now(ZoneInfo("America/New_York")).date()
+            if saved_date < today:
+                logger.info("Saved results are from a previous day — skipping load")
+                return
         recs = []
         for r in data.get("recommendations", []):
             recs.append(OptionsRecommendation(**{k: r[k] for k in r if k in OptionsRecommendation.__dataclass_fields__}))
@@ -333,6 +341,26 @@ def _load_results():
         pass
     except Exception as e:
         logger.warning(f"Could not load saved results: {e}")
+
+async def _eod_clear_loop():
+    """Clear results at 4:05 PM ET every trading day."""
+    import os as _os
+    while True:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        # Calculate seconds until next 4:05 PM ET
+        target = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        if now_et >= target:
+            target = target.replace(day=target.day + 1)
+        wait = (target - now_et).total_seconds()
+        await asyncio.sleep(wait)
+        global latest_options_recs, last_sp500_run
+        latest_options_recs = []
+        last_sp500_run = None
+        try:
+            _os.remove(_RESULTS_FILE)
+        except FileNotFoundError:
+            pass
+        logger.info("EOD: cleared SP500 results for next trading day")
 
 # Hourly snapshots: list of {"timestamp": str, "hour_label": str, "recommendations": [...]}
 # Only saved during market hours; cleared each new trading day.
@@ -545,6 +573,7 @@ async def lifespan(app: FastAPI):
 
     _load_results()
     sp500_task = asyncio.create_task(_init_all())
+    asyncio.create_task(_eod_clear_loop())
     logger.info("System initializing in background — server ready")
 
     yield
