@@ -11,10 +11,13 @@ import logging
 import os
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
+
+_ET = ZoneInfo("America/New_York")
 
 load_dotenv()
 
@@ -84,6 +87,26 @@ async def main():
     logger.info("=" * 50)
 
     while True:
+        now_et = datetime.now(_ET)
+        market_open  = now_et.replace(hour=9,  minute=25, second=0, microsecond=0)
+        market_close = now_et.replace(hour=16, minute=5,  second=0, microsecond=0)
+        is_weekday   = now_et.weekday() < 5
+
+        if not is_weekday or now_et < market_open or now_et >= market_close:
+            # Sleep until 9:25 AM ET next weekday
+            next_open = now_et.replace(hour=9, minute=25, second=0, microsecond=0)
+            if now_et >= market_close or not is_weekday:
+                days_ahead = 1
+                while (now_et.weekday() + days_ahead) % 7 >= 5:
+                    days_ahead += 1
+                from datetime import timedelta
+                next_open = (now_et + timedelta(days=days_ahead)).replace(
+                    hour=9, minute=25, second=0, microsecond=0)
+            wait_secs = max(60, (next_open - now_et).total_seconds())
+            logger.info(f"Market closed — sleeping {wait_secs/3600:.1f}h until {next_open.strftime('%a %I:%M %p ET')}")
+            await asyncio.sleep(min(wait_secs, 3600))  # wake hourly to recheck
+            continue
+
         try:
             recs = await run_once()
             if recs:
