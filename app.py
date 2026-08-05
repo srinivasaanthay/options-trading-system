@@ -511,14 +511,16 @@ async def lifespan(app: FastAPI):
     )
     logger.info("✅ Notification Manager initialized")
 
-    # Initialise paper trading (optional — only if Alpaca keys are set)
+    # Initialise paper trading in background (don't block startup)
     global paper_trader
     if _ALPACA_KEY and _ALPACA_SECRET:
-        logger.info("Initialising Alpaca paper trading...")
+        logger.info("Initialising Alpaca paper trading (background)...")
         paper_trader = PaperTradingService(_ALPACA_KEY, _ALPACA_SECRET)
-        loop = asyncio.get_event_loop()
-        ok = await loop.run_in_executor(None, paper_trader.connect)
-        logger.info("✅ Paper trader %s", "connected" if ok else "FAILED — check keys")
+        async def _connect_alpaca():
+            loop = asyncio.get_event_loop()
+            ok = await loop.run_in_executor(None, paper_trader.connect)
+            logger.info("✅ Paper trader %s", "connected" if ok else "FAILED — check keys")
+        asyncio.create_task(_connect_alpaca())
     else:
         logger.info("ℹ️  Paper trading disabled (set ALPACA_API_KEY + ALPACA_API_SECRET to enable)")
 
