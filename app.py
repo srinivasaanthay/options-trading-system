@@ -304,6 +304,36 @@ options_ws_connections: List[WebSocket] = []   # SP500 options live stream
 latest_options_recs: List[OptionsRecommendation] = []
 last_sp500_run: Optional[datetime] = None
 
+_RESULTS_FILE = "/tmp/sp500_results.json"
+
+def _save_results():
+    try:
+        import json as _json
+        data = {"last_run": last_sp500_run.isoformat() if last_sp500_run else None,
+                "recommendations": [asdict(r) for r in latest_options_recs]}
+        with open(_RESULTS_FILE, "w") as f:
+            _json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"Could not save results: {e}")
+
+def _load_results():
+    global latest_options_recs, last_sp500_run
+    try:
+        import json as _json
+        with open(_RESULTS_FILE) as f:
+            data = _json.load(f)
+        recs = []
+        for r in data.get("recommendations", []):
+            recs.append(OptionsRecommendation(**{k: r[k] for k in r if k in OptionsRecommendation.__dataclass_fields__}))
+        latest_options_recs = recs
+        if data.get("last_run"):
+            last_sp500_run = datetime.fromisoformat(data["last_run"])
+        logger.info(f"Loaded {len(latest_options_recs)} saved results from disk")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Could not load saved results: {e}")
+
 # Hourly snapshots: list of {"timestamp": str, "hour_label": str, "recommendations": [...]}
 # Only saved during market hours; cleared each new trading day.
 hourly_snapshots: List[Dict] = []
@@ -513,6 +543,7 @@ async def lifespan(app: FastAPI):
         if not os.getenv("PUSH_MODE"):
             await _sp500_scheduler_loop()
 
+    _load_results()
     sp500_task = asyncio.create_task(_init_all())
     logger.info("System initializing in background — server ready")
 
@@ -695,6 +726,7 @@ async def push_sp500_results(
 
     latest_options_recs = sorted(recs, key=lambda x: x.score, reverse=True)
     last_sp500_run = datetime.utcnow()
+    _save_results()
     logger.info(f"[push-results] Received {len(latest_options_recs)} recommendations from local runner")
     return {"received": len(latest_options_recs), "timestamp": last_sp500_run.isoformat()}
 
