@@ -473,65 +473,46 @@ async def _sp500_scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan context manager."""
-    global news_analyzer, technical_analyzer, options_analyzer
-    global market_analyzer, strategy_selector, call_put_predictor
-    global reasoning_generator, stock_agent, notification_manager
+    """Application lifespan — server starts immediately, everything else runs in background."""
 
-    logger.info("=" * 60)
-    logger.info("INITIALIZING TRADING SYSTEM")
-    logger.info("=" * 60)
+    async def _init_all():
+        global news_analyzer, technical_analyzer, options_analyzer
+        global market_analyzer, strategy_selector, call_put_predictor
+        global reasoning_generator, stock_agent, notification_manager, paper_trader
 
-    logger.info("Initializing Phase 3A analyzers...")
-    news_analyzer = NewsAnalyzer()
-    technical_analyzer = TechnicalAnalyzer()
-    options_analyzer = OptionsAnalyzer()
-    market_analyzer = MarketAnalyzer()
-    strategy_selector = StrategySelector()
-    call_put_predictor = CallPutPredictor()
-    reasoning_generator = ReasoningGenerator()
-    logger.info("✅ Phase 3A analyzers initialized")
+        logger.info("Initializing analyzers...")
+        news_analyzer = NewsAnalyzer()
+        technical_analyzer = TechnicalAnalyzer()
+        options_analyzer = OptionsAnalyzer()
+        market_analyzer = MarketAnalyzer()
+        strategy_selector = StrategySelector()
+        call_put_predictor = CallPutPredictor()
+        reasoning_generator = ReasoningGenerator()
+        stock_agent = MCPStockAgent()
+        notification_manager = NotificationManager(
+            slack_webhook=os.getenv("SLACK_WEBHOOK_URL"),
+            email_config={
+                "smtp_server": os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com"),
+                "smtp_port": int(os.getenv("EMAIL_SMTP_PORT", "587")),
+                "username": os.getenv("EMAIL_USER"),
+                "password": os.getenv("EMAIL_PASSWORD"),
+                "from_address": os.getenv("EMAIL_FROM", "alerts@trading-system.com")
+            },
+            discord_webhook=os.getenv("DISCORD_WEBHOOK_URL"),
+            custom_webhook=os.getenv("CUSTOM_WEBHOOK_URL")
+        )
+        logger.info("✅ Analyzers ready")
 
-    logger.info("Initializing MCP Stock Agent...")
-    stock_agent = MCPStockAgent()
-    logger.info("✅ MCP Stock Agent initialized")
-
-    logger.info("Initializing Notification Manager...")
-    notification_manager = NotificationManager(
-        slack_webhook=os.getenv("SLACK_WEBHOOK_URL"),
-        email_config={
-            "smtp_server": os.getenv("EMAIL_SMTP_SERVER", "smtp.gmail.com"),
-            "smtp_port": int(os.getenv("EMAIL_SMTP_PORT", "587")),
-            "username": os.getenv("EMAIL_USER"),
-            "password": os.getenv("EMAIL_PASSWORD"),
-            "from_address": os.getenv("EMAIL_FROM", "alerts@trading-system.com")
-        },
-        discord_webhook=os.getenv("DISCORD_WEBHOOK_URL"),
-        custom_webhook=os.getenv("CUSTOM_WEBHOOK_URL")
-    )
-    logger.info("✅ Notification Manager initialized")
-
-    # Initialise paper trading in background (don't block startup)
-    global paper_trader
-    if _ALPACA_KEY and _ALPACA_SECRET:
-        logger.info("Initialising Alpaca paper trading (background)...")
-        paper_trader = PaperTradingService(_ALPACA_KEY, _ALPACA_SECRET)
-        async def _connect_alpaca():
+        if _ALPACA_KEY and _ALPACA_SECRET:
+            paper_trader = PaperTradingService(_ALPACA_KEY, _ALPACA_SECRET)
             loop = asyncio.get_event_loop()
             ok = await loop.run_in_executor(None, paper_trader.connect)
-            logger.info("✅ Paper trader %s", "connected" if ok else "FAILED — check keys")
-        asyncio.create_task(_connect_alpaca())
-    else:
-        logger.info("ℹ️  Paper trading disabled (set ALPACA_API_KEY + ALPACA_API_SECRET to enable)")
+            logger.info("✅ Paper trader %s", "connected" if ok else "FAILED")
 
-    # Start SP500 scheduler as background task
-    logger.info("Starting SP500 options scheduler (every 20 min)...")
-    sp500_task = asyncio.create_task(_sp500_scheduler_loop())
-    logger.info("✅ SP500 scheduler started")
+        await _sp500_scheduler_loop()
 
-    logger.info("=" * 60)
-    logger.info("SYSTEM READY FOR TRADING")
-    logger.info("=" * 60)
+    sp500_task = asyncio.create_task(_init_all())
+    logger.info("System initializing in background — server ready")
 
     yield
 
