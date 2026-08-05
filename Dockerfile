@@ -21,6 +21,7 @@ COPY config.yaml .
 COPY logger.py .
 COPY helpers.py .
 COPY validators.py .
+COPY run.py .
 COPY start.sh .
 RUN chmod +x start.sh
 
