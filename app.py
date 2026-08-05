@@ -394,9 +394,14 @@ def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
 
 
 def _fallback_price(ticker: str) -> float:
-    """Deterministic fallback price when yfinance has no data for a ticker."""
-    seed = int(hashlib.md5(ticker.encode()).hexdigest(), 16) % 10000
-    return round(50.0 + (seed % 450), 2)
+    """Fetch individual price when batch download misses a ticker."""
+    try:
+        p = yf.Ticker(ticker).fast_info.last_price
+        if p and p > 0:
+            return round(float(p), 2)
+    except Exception:
+        pass
+    return 0.0
 
 
 async def _analyze_sp500_options() -> List[OptionsRecommendation]:
@@ -419,6 +424,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
                 continue
 
             price = price_map.get(ticker) or _fallback_price(ticker)
+            if not price or price <= 0:
+                continue
 
             result = await stock_agent.analyze_ticker(ticker, float(price))
 
