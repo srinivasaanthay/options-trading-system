@@ -437,6 +437,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
 async def _sp500_scheduler_loop():
     """Background loop: analyze SP500 every 20 minutes, push to WebSocket clients."""
+    # Wait for server to come up healthy before first scan
+    await asyncio.sleep(30)
     while True:
         try:
             recs = await _analyze_sp500_options()
