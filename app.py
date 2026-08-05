@@ -385,12 +385,12 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             logger.debug(f"[SP500] {ticker} skipped: {e}")
             continue
 
-    # Sort by score descending, keep top 50
+    # Sort by score descending, keep top 100
     recs.sort(key=lambda r: r.score, reverse=True)
-    latest_options_recs = recs[:50]
+    latest_options_recs = recs[:100]
     last_sp500_run = datetime.utcnow()
 
-    logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 50 kept")
+    logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept")
 
     # Save hourly snapshot — market hours only, reset each trading day
     global hourly_snapshots, _last_snapshot_hour, _last_snapshot_date
