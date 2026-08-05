@@ -405,19 +405,25 @@ def _fallback_price(ticker: str) -> float:
 
 
 async def _analyze_sp500_options() -> List[OptionsRecommendation]:
-    """Analyze all SP500 tickers, return top options recommendations."""
+    """Analyze top 500 liquid US stocks, return top options recommendations."""
     global latest_options_recs, last_sp500_run
 
-    logger.info(f"[SP500] Starting full analysis of {len(SP500_TICKERS)} tickers...")
+    from dynamic_tickers import get_dynamic_tickers
+    loop = asyncio.get_event_loop()
+    tickers = await loop.run_in_executor(None, get_dynamic_tickers)
+    if not tickers:
+        tickers = SP500_TICKERS  # fallback to static list
+
+    logger.info(f"[SP500] Starting full analysis of {len(tickers)} tickers...")
 
     # Fetch real prices + OHLCV for all tickers up front (one batch call each)
     loop = asyncio.get_event_loop()
-    price_map = await loop.run_in_executor(None, _fetch_prices_batch, SP500_TICKERS)
-    await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, SP500_TICKERS)
+    price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
+    await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, tickers)
 
     recs: List[OptionsRecommendation] = []
 
-    for idx, ticker in enumerate(SP500_TICKERS, 1):
+    for idx, ticker in enumerate(tickers, 1):
         try:
             # Skip tickers that have no real OHLCV data (delisted / bankrupt)
             if ticker not in stock_agent._ohlcv_cache:
