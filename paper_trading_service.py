@@ -301,9 +301,11 @@ class PaperTradingService:
                 if not contracts:
                     continue
 
-                # Prefer liquid contracts (have open interest), fall back to all
+                # Only trade liquid contracts (open interest > 0); skip illiquid ADRs
                 liquid = [c for c in contracts if c.open_interest and int(c.open_interest) > 0]
-                pool   = liquid if liquid else contracts
+                if not liquid:
+                    continue
+                pool = liquid
 
                 # Sort: nearest expiry, then closest strike to ATM
                 return min(pool, key=lambda c: (
@@ -330,7 +332,7 @@ class PaperTradingService:
             from alpaca.data.historical.option import OptionHistoricalDataClient
             from alpaca.data.requests import OptionLatestQuoteRequest
 
-            # Fix #1: use limit order at mid-price to avoid paying full ask spread
+            # Require a real market bid — skip options with no liquidity (e.g. foreign ADRs)
             limit_price = None
             try:
                 data_client = OptionHistoricalDataClient(self.api_key, self.api_secret)
@@ -342,25 +344,20 @@ class PaperTradingService:
                     mid = round((float(q.bid_price) + float(q.ask_price)) / 2, 2)
                     limit_price = max(mid, 0.01)
             except Exception as qe:
-                logger.warning("[PaperTrading] Quote fetch failed for %s: %s — using market", contract.symbol, qe)
+                logger.warning("[PaperTrading] Quote fetch failed for %s: %s", contract.symbol, qe)
 
-            if limit_price:
-                order_req = LimitOrderRequest(
-                    symbol=contract.symbol,
-                    qty=1,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price,
-                )
-                logger.info("[PaperTrading] Limit order at $%.2f (mid) for %s", limit_price, contract.symbol)
-            else:
-                from alpaca.trading.requests import MarketOrderRequest
-                order_req = MarketOrderRequest(
-                    symbol=contract.symbol,
-                    qty=1,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
+            if not limit_price:
+                logger.warning("[PaperTrading] Skipping %s — no real bid (illiquid option)", contract.symbol)
+                return None
+
+            order_req = LimitOrderRequest(
+                symbol=contract.symbol,
+                qty=1,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+            )
+            logger.info("[PaperTrading] Limit order at $%.2f (mid) for %s", limit_price, contract.symbol)
             order = self.client.submit_order(order_req)
 
             direction   = "LONG" if action == "CALL" else "SHORT"
