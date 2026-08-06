@@ -1220,11 +1220,36 @@ async def close_all_paper_positions(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     pt: PaperTradingService = Depends(_require_paper_trader)
 ):
-    """Close all open positions immediately (end-of-week cleanup)."""
+    """Close all open positions immediately — closes options individually since Alpaca bulk-close skips them."""
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, pt.client.close_all_positions)
-        return {"status": "all positions closed"}
+        closed = await loop.run_in_executor(None, pt.close_all_open_positions)
+        return {"status": "all positions closed", "closed": closed}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/paper-trading/close-stale")
+async def close_stale_positions(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    pt: PaperTradingService = Depends(_require_paper_trader)
+):
+    """Close positions held from a previous session (no entry in current trade_history)."""
+    try:
+        loop = asyncio.get_event_loop()
+        all_positions = await loop.run_in_executor(None, pt.client.get_all_positions)
+        tracked = {t.option_symbol for t in pt.trade_history if t.option_symbol}
+        closed, skipped = [], []
+        for p in all_positions:
+            if p.symbol not in tracked:
+                try:
+                    await loop.run_in_executor(None, pt.client.close_position, p.symbol)
+                    closed.append(p.symbol)
+                    logger.info("[PaperTrading] Closed stale position %s", p.symbol)
+                except Exception as e:
+                    skipped.append(p.symbol)
+                    logger.error("[PaperTrading] Could not close stale %s: %s", p.symbol, e)
+        return {"closed": len(closed), "symbols": closed, "skipped": skipped}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

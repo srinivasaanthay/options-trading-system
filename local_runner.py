@@ -29,6 +29,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def close_stale_on_railway():
+    """Close positions left over from previous sessions before first scan."""
+    url = f"{RAILWAY_URL}/api/v1/paper-trading/close-stale"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    try:
+        resp = requests.post(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("closed", 0) > 0:
+                logger.info(f"🧹 Closed {data['closed']} stale positions: {data['symbols']}")
+        else:
+            logger.warning(f"close-stale returned {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"close-stale failed: {e}")
+
+
 def push_to_railway(recs: list):
     url = f"{RAILWAY_URL}/api/v1/sp500/push-results"
     headers = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -86,6 +102,7 @@ async def main():
     logger.info(f"Interval: {INTERVAL//60} minutes")
     logger.info("=" * 50)
 
+    first_scan_done = False
     while True:
         now_et = datetime.now(_ET)
         market_open  = now_et.replace(hour=9,  minute=25, second=0, microsecond=0)
@@ -104,8 +121,14 @@ async def main():
                     hour=9, minute=25, second=0, microsecond=0)
             wait_secs = max(60, (next_open - now_et).total_seconds())
             logger.info(f"Market closed — sleeping {wait_secs/3600:.1f}h until {next_open.strftime('%a %I:%M %p ET')}")
+            first_scan_done = False  # reset for next session
             await asyncio.sleep(min(wait_secs, 3600))  # wake hourly to recheck
             continue
+
+        if not first_scan_done:
+            logger.info("First scan of session — closing any stale positions first...")
+            close_stale_on_railway()
+            first_scan_done = True
 
         try:
             recs = await run_once()
