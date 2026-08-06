@@ -108,11 +108,18 @@ class CallPutPredictor:
             else:
                 recommendation = 'PUT'
 
+            # Apply mean-reversion guardrails before finalising
+            confidence, recommendation, guardrail_notes = self._apply_guardrails(
+                prediction, confidence, recommendation, technical_analysis
+            )
+
             # Calculate directional strength
             directional_strength = self._calculate_directional_strength(features)
 
             # Get supporting factors
             supporting_factors = self._identify_supporting_factors(features)
+            if guardrail_notes:
+                supporting_factors = guardrail_notes + supporting_factors[:2]
 
             # Track prediction for retraining
             self.prediction_count += 1
@@ -311,6 +318,58 @@ class CallPutPredictor:
         prediction = 1 if confidence > 0.5 else 0
 
         return prediction, confidence
+
+    def _apply_guardrails(
+        self,
+        prediction: int,
+        confidence: float,
+        recommendation: str,
+        technical: Dict,
+    ):
+        """
+        Override ML confidence when well-known mean-reversion conditions apply.
+
+        Rules:
+        1. Oversold PUT (RSI < 38): likely a bounce, not continuation — penalty
+        2. Overbought CALL (RSI > 65): likely a pullback, not continuation — penalty
+        3. Extreme oversold + big down day (RSI < 32, momentum < -35): strong bounce risk
+        4. Extreme overbought + big up day (RSI > 72, momentum > 35): strong pullback risk
+        """
+        rsi = technical.get('rsi', 50)
+        momentum = technical.get('momentum', 0)  # MACD-based, -100 to +100
+        notes = []
+
+        is_put = (prediction == 0)
+        is_call = (prediction == 1)
+
+        # Rule 1 & 3: Oversold + PUT = dangerous (stock likely to bounce)
+        if is_put and rsi < 38:
+            if rsi < 32 and momentum < -35:
+                # Extreme — big single-day drop on oversold: high bounce risk
+                confidence = max(0.50, confidence - 0.25)
+                notes.append(f"⚠️ Extreme oversold RSI={rsi:.0f} — high bounce risk, PUT confidence cut")
+            else:
+                confidence = max(0.50, confidence - 0.12)
+                notes.append(f"⚠️ Oversold RSI={rsi:.0f} — mean-reversion risk on PUT")
+
+        # Rule 2 & 4: Overbought + CALL = dangerous (stock likely to pull back)
+        elif is_call and rsi > 65:
+            if rsi > 72 and momentum > 35:
+                confidence = max(0.50, confidence - 0.25)
+                notes.append(f"⚠️ Extreme overbought RSI={rsi:.0f} — pullback risk, CALL confidence cut")
+            else:
+                confidence = max(0.50, confidence - 0.12)
+                notes.append(f"⚠️ Overbought RSI={rsi:.0f} — mean-reversion risk on CALL")
+
+        # Re-evaluate recommendation after confidence adjustment
+        if confidence < self.min_confidence:
+            recommendation = 'neutral'
+        elif prediction == 1:
+            recommendation = 'CALL'
+        else:
+            recommendation = 'PUT'
+
+        return confidence, recommendation, notes
 
     def _calculate_directional_strength(self, features: List[float]) -> float:
         """
