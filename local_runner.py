@@ -60,6 +60,31 @@ def push_to_railway(recs: list):
         logger.error(f"❌ Push error: {e}")
 
 
+def execute_trades_on_railway():
+    """Trigger paper trade execution after each scan."""
+    url = f"{RAILWAY_URL}/api/v1/paper-trading/execute-now"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    try:
+        resp = requests.post(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            trades = data.get("trades_executed", 0)
+            if trades > 0:
+                details = ", ".join(
+                    f"{t.get('ticker','?')} {t.get('action','?')} ({t.get('score','?')})"
+                    for t in data.get("trades", [])
+                )
+                logger.info(f"📈 Executed {trades} trade(s): {details}")
+            else:
+                logger.info("📊 No new trades this scan (positions full or no qualifying recs)")
+        elif resp.status_code == 400 and "closed" in resp.text.lower():
+            pass  # market closed, expected
+        else:
+            logger.warning(f"execute-now returned {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.warning(f"execute-now failed: {e}")
+
+
 async def run_once():
     from app import _analyze_sp500_options, news_analyzer, technical_analyzer
     from app import options_analyzer, market_analyzer, strategy_selector
@@ -107,6 +132,7 @@ async def main():
         now_et = datetime.now(_ET)
         market_open  = now_et.replace(hour=9,  minute=25, second=0, microsecond=0)
         market_close = now_et.replace(hour=16, minute=5,  second=0, microsecond=0)
+        options_open = now_et.replace(hour=9,  minute=31, second=0, microsecond=0)
         is_weekday   = now_et.weekday() < 5
 
         if not is_weekday or now_et < market_open or now_et >= market_close:
@@ -126,14 +152,21 @@ async def main():
             continue
 
         if not first_scan_done:
-            logger.info("First scan of session — closing any stale positions first...")
-            close_stale_on_railway()
-            first_scan_done = True
+            if now_et >= options_open:
+                logger.info("First scan of session — closing any stale positions first...")
+                close_stale_on_railway()
+                first_scan_done = True
+            else:
+                wait_secs = (options_open - now_et).total_seconds()
+                logger.info(f"Waiting {wait_secs:.0f}s for options market open (9:31 AM)...")
+                await asyncio.sleep(wait_secs)
+                continue
 
         try:
             recs = await run_once()
             if recs:
                 push_to_railway(recs)
+                execute_trades_on_railway()
         except Exception as e:
             logger.error(f"Scan error: {e}", exc_info=True)
 
