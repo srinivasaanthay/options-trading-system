@@ -83,6 +83,7 @@ class PaperTradingService:
     COOLDOWN_HOURS      = 6
     MIN_EXPIRY_DAYS     = 25        # minimum days to expiry when entering
     MAX_EXPIRY_DAYS     = 50        # maximum days to expiry when entering
+    DAILY_MAX_LOSS      = 2_000.0   # stop new entries if realized+unrealized loss exceeds this today
 
     def __init__(self, api_key: str, api_secret: str):
         self.api_key    = api_key
@@ -93,6 +94,8 @@ class PaperTradingService:
 
         self.trade_history: List[TradeRecord] = []
         self._last_traded: Dict[str, datetime] = {}
+        self._daily_loss_date: Optional[str] = None
+        self._daily_loss_tripped: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -225,6 +228,35 @@ class PaperTradingService:
     def execute_signals(self, recommendations: List[Dict]) -> List[Dict]:
         if not self.connected:
             logger.warning("[PaperTrading] Not connected — skipping execution")
+            return []
+
+        # Daily max-loss circuit breaker — reset each calendar day
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._daily_loss_date != today:
+            self._daily_loss_date = today
+            self._daily_loss_tripped = False
+
+        if not self._daily_loss_tripped:
+            try:
+                acc = self.client.get_account()
+                unrealized = float(getattr(acc, 'unrealized_pl', 0) or 0)
+                closed_today = [
+                    t for t in self.trade_history
+                    if t.status == "closed" and t.pnl is not None
+                    and (t.exit_time or "").startswith(today)
+                ]
+                realized_today = sum(t.pnl for t in closed_today)
+                total_loss_today = realized_today + min(0.0, unrealized)
+                if total_loss_today <= -self.DAILY_MAX_LOSS:
+                    self._daily_loss_tripped = True
+                    logger.warning(
+                        "[PaperTrading] Daily max loss tripped ($%.0f) — no new entries today",
+                        total_loss_today
+                    )
+            except Exception:
+                pass
+
+        if self._daily_loss_tripped:
             return []
 
         eligible = [r for r in recommendations if r.get("score", 0) >= self.MIN_SIGNAL_SCORE]
@@ -432,23 +464,17 @@ class PaperTradingService:
         if not self.connected:
             return
         try:
-            import yfinance as yf
             open_trades = [t for t in self.trade_history if t.status == "open" and t.option_symbol]
             now = datetime.now(timezone.utc)
 
             for trade in open_trades:
-                # Age check
                 entry_dt = datetime.fromisoformat(trade.entry_time.replace("Z", "+00:00"))
                 if entry_dt.tzinfo is None:
                     entry_dt = entry_dt.replace(tzinfo=timezone.utc)
                 age_hours = (now - entry_dt).total_seconds() / 3600
 
-                # Get current underlying price
-                try:
-                    fi = yf.Ticker(trade.ticker).fast_info
-                    current = float(getattr(fi, 'last_price', 0) or trade.entry_price)
-                except Exception:
-                    current = trade.entry_price
+                # Use Alpaca real-time price (not delayed yfinance)
+                current = self._get_realtime_price(trade.ticker) or trade.entry_price
 
                 hit_stop   = (trade.direction == "LONG"  and current <= trade.stop_loss) or \
                              (trade.direction == "SHORT" and current >= trade.stop_loss)
@@ -456,7 +482,7 @@ class PaperTradingService:
                              (trade.direction == "SHORT" and current <= trade.take_profit)
 
                 if age_hours >= self.HOLD_HOURS or hit_stop or hit_target:
-                    reason = ("expired"      if age_hours >= self.HOLD_HOURS
+                    reason = ("expired"     if age_hours >= self.HOLD_HOURS
                               else "stop_loss"  if hit_stop
                               else "take_profit")
                     self._close_option_position(trade, current, reason)
@@ -467,6 +493,21 @@ class PaperTradingService:
     def _close_option_position(self, trade: TradeRecord, current_price: float, reason: str) -> None:
         """Sell an options contract and record the trade outcome."""
         try:
+            # Check option has a real bid before closing — prevents $0 fill on illiquid options
+            try:
+                from alpaca.data.requests import OptionLatestQuoteRequest
+                quotes = self.data_client.get_option_latest_quote(
+                    OptionLatestQuoteRequest(symbol_or_symbols=trade.option_symbol)
+                )
+                q = quotes.get(trade.option_symbol)
+                if q and float(q.bid_price or 0) <= 0:
+                    logger.warning(
+                        "[PaperTrading] Skipping close of %s — bid is $0 (illiquid). Will retry next scan.",
+                        trade.option_symbol
+                    )
+                    return
+            except Exception:
+                pass  # proceed with close if quote check fails
             self.client.close_position(trade.option_symbol)
 
             entry = trade.entry_price
