@@ -257,7 +257,7 @@ class PaperTradingService:
             if price <= 0 or self._is_in_cooldown(ticker):
                 continue
 
-            # Fix #2: skip if underlying already moved >2.5% intraday (chasing)
+            # Skip if underlying already moved >2.5% intraday (chasing)
             intraday_move = self._get_intraday_move(ticker)
             if abs(intraday_move) > 0.025:
                 logger.info(
@@ -265,6 +265,19 @@ class PaperTradingService:
                     ticker, intraday_move * 100
                 )
                 continue
+
+            # Real-time staleness check: yfinance data is 15-20 min delayed.
+            # Fetch current Alpaca quote and skip if price drifted >3% from rec.
+            rt_price = self._get_realtime_price(ticker)
+            if rt_price and rt_price > 0 and price > 0:
+                drift = abs(rt_price - price) / price
+                if drift > 0.03:
+                    logger.info(
+                        "[PaperTrading] Skipping %s — rec price $%.2f stale, now $%.2f (%.1f%% drift)",
+                        ticker, price, rt_price, drift * 100
+                    )
+                    continue
+                price = rt_price  # use fresh price for order sizing
 
             result = self._place_option_order(ticker, action, price, score)
             if result:
@@ -565,3 +578,17 @@ class PaperTradingService:
         except Exception:
             pass
         return 0.0
+
+    def _get_realtime_price(self, ticker: str) -> Optional[float]:
+        """Get real-time price from Alpaca market data (not delayed like yfinance)."""
+        try:
+            from alpaca.data.requests import StockLatestQuoteRequest
+            req = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+            quotes = self.data_client.get_stock_latest_quote(req)
+            q = quotes.get(ticker)
+            if q:
+                mid = (float(q.ask_price) + float(q.bid_price)) / 2
+                return mid if mid > 0 else float(q.ask_price or q.bid_price or 0)
+        except Exception as e:
+            logger.debug("[PaperTrading] Real-time price fetch failed for %s: %s", ticker, e)
+        return None
