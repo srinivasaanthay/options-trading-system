@@ -174,6 +174,11 @@ class OptionsRecommendation:
     rs_vs_spy: float = 0.0
     days_to_earnings: int = 999
     analyst_upside: float = 0.0
+    news_headlines: list = None  # display-only, not used in scoring
+
+    def __post_init__(self):
+        if self.news_headlines is None:
+            self.news_headlines = []
 
 
 def _next_monthly_expiry(from_date: datetime = None) -> str:
@@ -225,32 +230,28 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
     # Normalise RS: −5% vs SPY → 0.0,  0% → 0.5,  +5% → 1.0
     rs_score = min(1.0, max(0.0, (rs + 5.0) / 10.0))
 
-    # IV factor: cheap options (IV rank < 30) get a 10% bonus; expensive (> 70) get 20% penalty
-    # iv_rank == 0.0 means data unavailable — treat as neutral (50), not cheap
+    # IV score: cheap options (low rank) = better to buy — normalised 0→1
+    # iv_rank == 0.0 means data unavailable — treat as neutral (50)
     effective_iv = iv_rank if iv_rank > 0.0 else 50.0
-    if effective_iv < 30:
-        iv_factor = 1.10
-    elif effective_iv > 70:
-        iv_factor = 0.80
-    else:
-        iv_factor = 1.0
+    iv_score = max(0.0, 1.0 - (effective_iv / 100.0))  # rank 10 → 0.90, rank 80 → 0.20
 
     # ── Expert composite score ────────────────────────────────────────────────
-    # Weights: technical=30%, sentiment=15%, RS vs SPY=25%, volume=15%, fundamentals=15%
+    # Weights: technical=30%, RS vs SPY=25%, IV rank=20%, volume=15%, fundamentals=10%
+    # Sentiment removed — lexicon scoring adds noise, not signal for short-term options
     if is_bearish:
         raw = ((1.0 - tech)     * 0.30 +
-               (1.0 - sent)     * 0.15 +
                (1.0 - rs_score) * 0.25 +
+               iv_score         * 0.20 +
                vol_score        * 0.15 +
-               (1.0 - fund)     * 0.15)
+               (1.0 - fund)     * 0.10)
     else:
-        raw = (tech     * 0.30 +
-               sent     * 0.15 +
-               rs_score * 0.25 +
+        raw = (tech      * 0.30 +
+               rs_score  * 0.25 +
+               iv_score  * 0.20 +
                vol_score * 0.15 +
-               fund      * 0.15)
+               fund      * 0.10)
 
-    score = round(min(1.0, max(0.0, raw * iv_factor)), 4)
+    score = round(min(1.0, max(0.0, raw)), 4)
 
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
@@ -278,6 +279,39 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
         days_to_earnings=getattr(analysis_result, 'days_to_earnings', 999),
         analyst_upside=round(getattr(analysis_result, 'analyst_upside', 0.0), 1),
     )
+
+
+_POSITIVE_WORDS = {'surge','soar','rally','gain','growth','profit','strong','rebound','upgrade',
+                   'beat','exceed','bullish','outstanding','breakthrough','positive','optimistic'}
+_NEGATIVE_WORDS = {'crash','collapse','plunge','plummet','decline','weak','miss','loss','bearish',
+                   'downgrade','disappointing','crisis','recession','failure','drop','poor'}
+
+def _fetch_ticker_news(ticker: str) -> list:
+    """Fetch up to 5 recent headlines for a ticker via yfinance. Display-only, not used in scoring."""
+    try:
+        import yfinance as yf
+        items = yf.Ticker(ticker).news or []
+        result = []
+        for item in items[:5]:
+            title = item.get('title', '') or ''
+            words = set(title.lower().split())
+            pos = len(words & _POSITIVE_WORDS)
+            neg = len(words & _NEGATIVE_WORDS)
+            if pos > neg:
+                sentiment = 'positive'
+            elif neg > pos:
+                sentiment = 'negative'
+            else:
+                sentiment = 'neutral'
+            result.append({
+                'title': title,
+                'publisher': item.get('publisher', ''),
+                'published_at': item.get('providerPublishTime', 0),
+                'sentiment': sentiment,
+            })
+        return result
+    except Exception:
+        return []
 
 
 # ============================================================================
@@ -458,7 +492,13 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
     # Sort by score descending, keep top 100
     recs.sort(key=lambda r: r.score, reverse=True)
-    latest_options_recs = recs[:100]
+    top_recs = recs[:100]
+
+    # Fetch news for top 20 only (display-only, not used in scoring)
+    for rec in top_recs[:20]:
+        rec.news_headlines = _fetch_ticker_news(rec.ticker)
+
+    latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
 
     logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept")
