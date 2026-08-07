@@ -408,27 +408,71 @@ _last_snapshot_date: Optional[str]  = None  # ET date of last saved snapshot (cl
 # ============================================================================
 
 def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
-    """Batch-fetch latest closing prices via yfinance. Falls back to hash-derived price on failure."""
+    """Fetch real-time mid-prices via Alpaca snapshots. Falls back to yfinance on failure."""
     prices: Dict[str, float] = {}
-    try:
-        data = yf.download(tickers, period="1d", progress=False, auto_adjust=True, threads=True)
-        close = data["Close"] if "Close" in data.columns else data
-        last_row = close.iloc[-1]
-        for ticker in tickers:
-            try:
-                p = float(last_row[ticker])
-                if p > 0 and not math.isnan(p):
-                    prices[ticker] = round(p, 2)
-            except Exception:
-                pass
-        logger.info(f"[yfinance] Fetched prices for {len(prices)}/{len(tickers)} tickers")
-    except Exception as e:
-        logger.warning(f"[yfinance] Batch fetch failed: {e}")
+
+    # Primary: Alpaca real-time snapshots
+    if _ALPACA_KEY and _ALPACA_SECRET:
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockSnapshotRequest
+            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+            chunk_size = 500
+            for i in range(0, len(tickers), chunk_size):
+                chunk = tickers[i:i + chunk_size]
+                snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+                for sym, snap in snaps.items():
+                    p = 0.0
+                    if snap.latest_quote:
+                        ask = float(snap.latest_quote.ask_price or 0)
+                        bid = float(snap.latest_quote.bid_price or 0)
+                        p = (ask + bid) / 2 if ask > 0 and bid > 0 else ask or bid
+                    if p <= 0 and snap.latest_trade:
+                        p = float(snap.latest_trade.price or 0)
+                    if p > 0:
+                        prices[sym] = round(p, 2)
+            logger.info(f"[Alpaca] Real-time prices for {len(prices)}/{len(tickers)} tickers")
+        except Exception as e:
+            logger.warning(f"[Alpaca] Snapshot failed: {e} — falling back to yfinance")
+
+    # Fallback: yfinance for any tickers Alpaca missed
+    missing = [t for t in tickers if t not in prices]
+    if missing:
+        try:
+            data = yf.download(missing, period="1d", progress=False, auto_adjust=True, threads=True)
+            close = data["Close"] if "Close" in data.columns else data
+            last_row = close.iloc[-1]
+            for ticker in missing:
+                try:
+                    p = float(last_row[ticker])
+                    if p > 0 and not math.isnan(p):
+                        prices[ticker] = round(p, 2)
+                except Exception:
+                    pass
+            logger.info(f"[yfinance] Fallback prices for {len([t for t in missing if t in prices])}/{len(missing)} tickers")
+        except Exception as e:
+            logger.warning(f"[yfinance] Fallback batch failed: {e}")
+
     return prices
 
 
 def _fallback_price(ticker: str) -> float:
-    """Fetch individual price when batch download misses a ticker."""
+    """Fetch individual real-time price via Alpaca. Falls back to yfinance."""
+    if _ALPACA_KEY and _ALPACA_SECRET:
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+            client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+            quotes = client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=ticker))
+            q = quotes.get(ticker)
+            if q:
+                ask = float(q.ask_price or 0)
+                bid = float(q.bid_price or 0)
+                p = (ask + bid) / 2 if ask > 0 and bid > 0 else ask or bid
+                if p > 0:
+                    return round(p, 2)
+        except Exception:
+            pass
     try:
         p = yf.Ticker(ticker).fast_info.last_price
         if p and p > 0:
