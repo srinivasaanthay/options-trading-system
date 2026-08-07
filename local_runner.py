@@ -23,7 +23,7 @@ load_dotenv()
 
 RAILWAY_URL = os.getenv("RAILWAY_URL", "https://arka.up.railway.app")
 API_TOKEN   = os.getenv("API_SECRET_KEY", "arka-secret-2024")
-INTERVAL    = 19 * 60  # 19 minutes
+INTERVAL    = 5 * 60   # 5 minutes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
