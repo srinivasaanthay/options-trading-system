@@ -85,6 +85,33 @@ def execute_trades_on_railway():
         logger.warning(f"execute-now failed: {e}")
 
 
+def execute_stocks_on_railway():
+    """Trigger stock trade execution after each scan."""
+    url = f"{RAILWAY_URL}/api/v1/stock-trading/execute-now"
+    headers = {"Authorization": f"Bearer {API_TOKEN}"}
+    try:
+        resp = requests.post(url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            trades = data.get("trades_executed", 0)
+            dry = data.get("dry_run", False)
+            if trades > 0:
+                details = ", ".join(
+                    f"{t.get('ticker','?')} ${t.get('entry_price','?')} ({t.get('signal_score','?')})"
+                    for t in data.get("trades", [])
+                )
+                tag = "[DRY RUN] " if dry else ""
+                logger.info(f"🏦 {tag}Stock trades {trades}: {details}")
+        elif resp.status_code == 400 and "closed" in resp.text.lower():
+            pass  # market closed, expected
+        elif resp.status_code == 503:
+            pass  # stock trader not yet initialised on Railway
+        else:
+            logger.warning(f"stock execute-now returned {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.warning(f"stock execute-now failed: {e}")
+
+
 async def run_once():
     from app import _analyze_sp500_options, news_analyzer, technical_analyzer
     from app import options_analyzer, market_analyzer, strategy_selector
@@ -167,6 +194,7 @@ async def main():
             if recs:
                 push_to_railway(recs)
                 execute_trades_on_railway()
+                execute_stocks_on_railway()
         except Exception as e:
             logger.error(f"Scan error: {e}", exc_info=True)
 
