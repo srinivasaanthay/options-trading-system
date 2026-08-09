@@ -177,10 +177,13 @@ class OptionsRecommendation:
     days_to_earnings: int = 999
     analyst_upside: float = 0.0
     news_headlines: list = None  # display-only, not used in scoring
+    fundamentals: dict = None    # balance sheet, cash flow, income — top 20 only
 
     def __post_init__(self):
         if self.news_headlines is None:
             self.news_headlines = []
+        if self.fundamentals is None:
+            self.fundamentals = {}
 
 
 def _next_monthly_expiry(from_date: datetime = None) -> str:
@@ -314,6 +317,34 @@ def _fetch_ticker_news(ticker: str) -> list:
         return result
     except Exception:
         return []
+
+
+def _fetch_fundamentals(ticker: str) -> dict:
+    """Fetch key fundamental metrics from yfinance for display in Before You Buy."""
+    try:
+        info = yf.Ticker(ticker).info
+        def _f(key, default=None):
+            v = info.get(key)
+            return None if v is None or (isinstance(v, float) and (v != v)) else v
+
+        return {
+            "debt_to_equity":   _f("debtToEquity"),
+            "current_ratio":    _f("currentRatio"),
+            "total_cash":       _f("totalCash"),
+            "free_cashflow":    _f("freeCashflow"),
+            "operating_cashflow": _f("operatingCashflow"),
+            "revenue_growth":   _f("revenueGrowth"),
+            "earnings_growth":  _f("earningsGrowth"),
+            "profit_margins":   _f("profitMargins"),
+            "gross_margins":    _f("grossMargins"),
+            "trailing_pe":      _f("trailingPE"),
+            "forward_pe":       _f("forwardPE"),
+            "price_to_book":    _f("priceToBook"),
+            "return_on_equity": _f("returnOnEquity"),
+        }
+    except Exception as e:
+        logger.debug("[Fundamentals] %s failed: %s", ticker, e)
+        return {}
 
 
 # ============================================================================
@@ -540,9 +571,10 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     recs.sort(key=lambda r: r.score, reverse=True)
     top_recs = recs[:100]
 
-    # Fetch news for top 20 only (display-only, not used in scoring)
+    # Fetch news + fundamentals for top 20 only (Mac has no memory limits)
     for rec in top_recs[:20]:
         rec.news_headlines = _fetch_ticker_news(rec.ticker)
+        rec.fundamentals   = _fetch_fundamentals(rec.ticker)
 
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
@@ -853,6 +885,7 @@ async def push_sp500_results(
                 rs_vs_spy=r.get("rs_vs_spy", 0.0),
                 days_to_earnings=r.get("days_to_earnings", 999),
                 analyst_upside=r.get("analyst_upside", 0.0),
+                fundamentals=r.get("fundamentals", {}),
             ))
         except Exception as e:
             logger.warning(f"Skipping bad rec: {e}")
