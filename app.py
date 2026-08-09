@@ -730,7 +730,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Options Trading Recommendation System with MCP Agent",
     description="Comprehensive options analysis with intelligent stock monitoring agent",
-    version="3.2.0",
+    version="3.3.0",
     docs_url="/api/docs",
     openapi_url="/api/openapi.json",
     lifespan=lifespan
