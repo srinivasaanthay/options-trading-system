@@ -1,7 +1,7 @@
 """
 Integrated FastAPI Application with MCP Stock Analysis Agent
 
-Options Trading Recommendation System - Phase 3B with Agent Integration
+Options + Stock Trading Recommendation System - v3.3.0
 Provides API endpoints for analysis, portfolio, watchlist, and stock agent.
 
 Endpoints:
