@@ -84,6 +84,7 @@ class PaperTradingService:
     MIN_EXPIRY_DAYS     = 25        # minimum days to expiry when entering
     MAX_EXPIRY_DAYS     = 50        # maximum days to expiry when entering
     DAILY_MAX_LOSS      = 2_000.0   # stop new entries if realized+unrealized loss exceeds this today
+    OPTION_MULTIPLIER   = 100.0     # contract-to-share multiplier for standard equity options
 
     def __init__(self, api_key: str, api_secret: str):
         self.api_key    = api_key
@@ -192,6 +193,65 @@ class PaperTradingService:
             logger.error("[PaperTrading] get_recent_orders failed: %s", e)
             return []
 
+    @staticmethod
+    def _occ_option_type(symbol: str) -> str:
+        """Extract call/put from a standard OCC option symbol, e.g.
+        'TSEM260904C00265000' -> 'call'. Falls back to 'unknown'."""
+        import re
+        m = re.search(r"\d{6}([CP])\d{8}$", symbol)
+        if not m:
+            return "unknown"
+        return "call" if m.group(1) == "C" else "put"
+
+    def get_realized_stats(self, limit: int = 500) -> Dict:
+        """Reconstruct closed round-trip trades from Alpaca's own filled-order
+        history, matching buys to sells FIFO per contract symbol.
+
+        self.trade_history only lives in process memory and resets on every
+        restart (Railway's free tier restarts/redeploys often), so it can't be
+        trusted as the source of truth for realized stats. Alpaca's order
+        history persists in their cloud regardless of our process lifecycle.
+        """
+        orders = self.get_recent_orders(limit=limit)
+        filled = [o for o in orders if o["status"] == "filled" and o["filled_at"]]
+        filled.sort(key=lambda o: o["filled_at"])
+
+        open_lots: Dict[str, List[Dict]] = {}
+        closed_trades: List[Dict] = []
+
+        for o in filled:
+            symbol, qty, price = o["symbol"], o["filled_qty"], o["filled_avg_price"]
+            if o["side"] == "buy":
+                open_lots.setdefault(symbol, []).append({"qty": qty, "price": price})
+                continue
+
+            remaining = qty
+            lots = open_lots.get(symbol, [])
+            while remaining > 0 and lots:
+                lot = lots[0]
+                matched = min(remaining, lot["qty"])
+                pnl = (price - lot["price"]) * matched * self.OPTION_MULTIPLIER
+                closed_trades.append({
+                    "symbol": symbol, "qty": matched,
+                    "entry_price": lot["price"], "exit_price": price,
+                    "pnl": round(pnl, 2),
+                    "type": self._occ_option_type(symbol),
+                })
+                lot["qty"] -= matched
+                remaining -= matched
+                if lot["qty"] <= 0:
+                    lots.pop(0)
+
+        winning = [t for t in closed_trades if t["pnl"] > 0]
+        return {
+            "closed_trades":  closed_trades,
+            "realized_pnl":   round(sum(t["pnl"] for t in closed_trades), 2),
+            "total_trades":   len(closed_trades),
+            "winning_trades": len(winning),
+            "losing_trades":  len(closed_trades) - len(winning),
+            "win_rate":       round(len(winning) / len(closed_trades) * 100, 1) if closed_trades else 0.0,
+        }
+
     def get_portfolio_snapshot(self) -> PortfolioSnapshot:
         acc = self.get_account() or {}
         equity        = acc.get("equity",          self.STARTING_CAPITAL)
@@ -199,10 +259,7 @@ class PaperTradingService:
         portfolio_val = acc.get("portfolio_value",  self.STARTING_CAPITAL)
         unrealized    = acc.get("unrealized_pl",    0.0)
 
-        closed = [t for t in self.trade_history if t.status == "closed" and t.pnl is not None]
-        realized  = sum(t.pnl for t in closed)
-        winning   = [t for t in closed if (t.pnl or 0) > 0]
-        losing    = [t for t in closed if (t.pnl or 0) <= 0]
+        stats     = self.get_realized_stats()
         total_ret = ((portfolio_val - self.STARTING_CAPITAL) / self.STARTING_CAPITAL) * 100
 
         return PortfolioSnapshot(
@@ -211,13 +268,13 @@ class PaperTradingService:
             portfolio_value  = portfolio_val,
             equity           = equity,
             unrealized_pnl   = unrealized,
-            realized_pnl     = realized,
+            realized_pnl     = stats["realized_pnl"],
             total_return_pct = round(total_ret, 2),
             open_positions   = len(self.get_positions()),
-            total_trades     = len(closed),
-            winning_trades   = len(winning),
-            losing_trades    = len(losing),
-            win_rate         = round(len(winning) / len(closed) * 100, 1) if closed else 0.0,
+            total_trades     = stats["total_trades"],
+            winning_trades   = stats["winning_trades"],
+            losing_trades    = stats["losing_trades"],
+            win_rate         = stats["win_rate"],
         )
 
     def get_trade_history(self) -> List[Dict]:

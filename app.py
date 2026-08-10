@@ -1292,23 +1292,25 @@ async def get_paper_performance(pt: PaperTradingService = Depends(_require_paper
     """Performance summary: win rate, P&L, return vs $1000 start."""
     loop = asyncio.get_event_loop()
     snapshot = await loop.run_in_executor(None, pt.get_portfolio_snapshot)
-    closed = [t for t in pt.trade_history if t.status == "closed" and t.pnl is not None]
+    realized = await loop.run_in_executor(None, pt.get_realized_stats)
+    closed = realized["closed_trades"]
 
-    # Break down by direction
-    long_trades  = [t for t in closed if t.direction == "LONG"]
-    short_trades = [t for t in closed if t.direction == "SHORT"]
+    # Break down by option type (reconstructed from Alpaca's own order history,
+    # not pt.trade_history — that resets on every process restart)
+    long_trades  = [t for t in closed if t["type"] == "call"]
+    short_trades = [t for t in closed if t["type"] == "put"]
 
     def stats(trades):
         if not trades:
             return {"count": 0, "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0, "avg_pnl": 0}
-        wins = [t for t in trades if (t.pnl or 0) > 0]
+        wins = [t for t in trades if t["pnl"] > 0]
         return {
             "count":     len(trades),
             "wins":      len(wins),
             "losses":    len(trades) - len(wins),
             "win_rate":  round(len(wins) / len(trades) * 100, 1),
-            "total_pnl": round(sum(t.pnl or 0 for t in trades), 2),
-            "avg_pnl":   round(sum(t.pnl or 0 for t in trades) / len(trades), 2),
+            "total_pnl": round(sum(t["pnl"] for t in trades), 2),
+            "avg_pnl":   round(sum(t["pnl"] for t in trades) / len(trades), 2),
         }
 
     return {
