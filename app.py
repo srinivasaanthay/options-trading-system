@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import asyncio
 from dataclasses import dataclass, asdict
 from zoneinfo import ZoneInfo
@@ -214,6 +214,27 @@ def _strike_for_action(price: float, action: str) -> float:
         return rounded - 5 if price < rounded else rounded
 
 
+def _interpret_composite_score(score: float) -> Tuple[str, str]:
+    """Map the composite ranking score (technical/RS/IV-rank/volume/fundamentals,
+    see _make_options_rec) to (confidence, buy_signal) — so the label shown next
+    to a ticker always agrees with where it ranks.
+
+    Thresholds are calibrated to *this* score's own range, not borrowed from
+    mcp_stock_agent.py's separate sentiment/ML-weighted score (which runs
+    higher and would otherwise collapse everything here into one bucket —
+    this formula has topped out around 0.74 in practice)."""
+    if score >= 0.80:
+        return "VERY_HIGH", "STRONG_BUY"
+    elif score >= 0.70:
+        return "HIGH", "BUY"
+    elif score >= 0.65:
+        return "MODERATE", "ACCUMULATE"
+    elif score >= 0.55:
+        return "LOW", "HOLD"
+    else:
+        return "VERY_LOW", "AVOID"
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring."""
     is_bearish = (analysis_result.technical_score < 0.48 or
@@ -257,6 +278,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
                fund      * 0.10)
 
     score = round(min(1.0, max(0.0, raw)), 4)
+    confidence, buy_signal = _interpret_composite_score(score)
 
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
@@ -269,9 +291,9 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
         strike_price=strike,
         expiry_date=expiry,
         score=score,
-        confidence=analysis_result.confidence.value,
+        confidence=confidence,
         current_price=price,
-        buy_signal=analysis_result.buy_signal.value,
+        buy_signal=buy_signal,
         technical_score=round(analysis_result.technical_score, 4),
         sentiment_score=round(analysis_result.sentiment_score, 4),
         ml_score=round(analysis_result.ml_score, 4),
