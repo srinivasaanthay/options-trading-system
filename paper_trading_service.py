@@ -75,7 +75,7 @@ class PaperTradingService:
     """
 
     STARTING_CAPITAL    = 100_000.0
-    MAX_OPEN_POSITIONS  = 8
+    MAX_OPEN_POSITIONS  = 10
     HOLD_HOURS          = 24
     STOP_LOSS_PCT       = 0.03      # close if underlying moves 3% against us
     TAKE_PROFIT_PCT     = 0.05      # close if underlying moves 5% in our favour
