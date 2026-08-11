@@ -76,6 +76,7 @@ output/
 temp/
 .analysis_cache/
 *.pid
+scan_history/
 
 # Security
 keys/

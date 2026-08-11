@@ -7,6 +7,7 @@ Usage:
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -24,6 +25,8 @@ load_dotenv()
 RAILWAY_URL = os.getenv("RAILWAY_URL", "https://arka.up.railway.app")
 API_TOKEN   = os.getenv("API_SECRET_KEY", "arka-secret-2024")
 INTERVAL    = 5 * 60   # 5 minutes
+
+SCAN_HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -43,6 +46,26 @@ def close_stale_on_railway():
             logger.warning(f"close-stale returned {resp.status_code}")
     except Exception as e:
         logger.warning(f"close-stale failed: {e}")
+
+
+def save_scan_locally(recs: list):
+    """Archive this scan to disk so signals can be checked against actual
+    price action later — Railway's recs cache is in-memory and gets wiped
+    on every restart/redeploy, so it can't be the historical record."""
+    now_et = datetime.now(_ET)
+    day_dir = os.path.join(SCAN_HISTORY_DIR, now_et.strftime("%Y-%m-%d"))
+    os.makedirs(day_dir, exist_ok=True)
+    path = os.path.join(day_dir, f"{now_et.strftime('%H%M%S')}.json")
+    payload = {
+        "timestamp": now_et.isoformat(),
+        "recommendations": [asdict(r) if hasattr(r, '__dataclass_fields__') else r for r in recs],
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info(f"💾 Saved scan to {path}")
+    except Exception as e:
+        logger.error(f"❌ Local save failed: {e}")
 
 
 def push_to_railway(recs: list):
@@ -192,6 +215,7 @@ async def main():
         try:
             recs = await run_once()
             if recs:
+                save_scan_locally(recs)
                 push_to_railway(recs)
                 execute_trades_on_railway()
                 execute_stocks_on_railway()
