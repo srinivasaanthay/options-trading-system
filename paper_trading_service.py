@@ -85,6 +85,7 @@ class PaperTradingService:
     MAX_EXPIRY_DAYS     = 50        # maximum days to expiry when entering
     DAILY_MAX_LOSS      = 2_000.0   # stop new entries if realized+unrealized loss exceeds this today
     OPTION_MULTIPLIER   = 100.0     # contract-to-share multiplier for standard equity options
+    MIN_OPEN_INTEREST   = 1000      # below this, contracts are too thin to trade reliably
 
     def __init__(self, api_key: str, api_secret: str):
         self.api_key    = api_key
@@ -403,8 +404,9 @@ class PaperTradingService:
                 if not contracts:
                     continue
 
-                # Only trade liquid contracts (open interest > 0); skip illiquid ADRs
-                liquid = [c for c in contracts if c.open_interest and int(c.open_interest) > 0]
+                # Only trade genuinely liquid contracts — thin OI means wide
+                # spreads and bad fills even if the trade itself works out.
+                liquid = [c for c in contracts if c.open_interest and int(c.open_interest) >= self.MIN_OPEN_INTEREST]
                 if not liquid:
                     continue
                 pool = liquid

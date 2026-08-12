@@ -235,6 +235,51 @@ def _interpret_composite_score(score: float) -> Tuple[str, str]:
         return "VERY_LOW", "AVOID"
 
 
+MIN_OPEN_INTEREST = 1000  # below this, contracts are too thin to trade reliably (wide spreads, bad fills)
+
+_liquidity_client = None  # lazy, cached Alpaca TradingClient — independent of paper_trader,
+                           # which local_runner.py's process never initializes
+
+
+def _get_liquidity_client():
+    global _liquidity_client
+    if _liquidity_client is None and _ALPACA_KEY and _ALPACA_SECRET:
+        try:
+            from alpaca.trading.client import TradingClient
+            _liquidity_client = TradingClient(_ALPACA_KEY, _ALPACA_SECRET, paper=True)
+        except Exception as e:
+            logger.warning(f"[Liquidity] Could not init Alpaca client: {e}")
+    return _liquidity_client
+
+
+def _check_open_interest(ticker: str, strike: float, expiry: str, action: str) -> Optional[int]:
+    """Look up real open interest for this exact contract via Alpaca.
+    Returns None (not 0) on any lookup failure, so callers can tell
+    'genuinely thin' apart from 'couldn't check' and fail open rather
+    than silently dropping every rec when Alpaca is unavailable."""
+    client = _get_liquidity_client()
+    if client is None:
+        return None
+    try:
+        from alpaca.trading.requests import GetOptionContractsRequest
+        from alpaca.trading.enums import ContractType
+        req = GetOptionContractsRequest(
+            underlying_symbols=[ticker],
+            expiration_date_gte=datetime.strptime(expiry, "%Y-%m-%d").date(),
+            expiration_date_lte=datetime.strptime(expiry, "%Y-%m-%d").date(),
+            type=ContractType.CALL if action == "CALL" else ContractType.PUT,
+            strike_price_gte=str(strike), strike_price_lte=str(strike),
+        )
+        resp = client.get_option_contracts(req)
+        contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
+        if not contracts:
+            return 0
+        return int(contracts[0].open_interest or 0)
+    except Exception as e:
+        logger.debug(f"[Liquidity] {ticker} OI check failed: {e}")
+        return None
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring."""
     is_bearish = (analysis_result.technical_score < 0.48 or
@@ -592,6 +637,21 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # Sort by score descending, keep top 100
     recs.sort(key=lambda r: r.score, reverse=True)
     top_recs = recs[:100]
+
+    # Liquidity filter — drop contracts too thin to trade reliably (see
+    # MIN_OPEN_INTEREST). Checked here, not earlier, so only the ~100
+    # candidates that already cleared scoring pay the extra Alpaca lookup.
+    liquid_recs = []
+    for rec in top_recs:
+        oi = _check_open_interest(rec.ticker, rec.strike_price, rec.expiry_date, rec.action)
+        if oi is None or oi >= MIN_OPEN_INTEREST:
+            liquid_recs.append(rec)
+        else:
+            logger.debug(f"[Liquidity] Dropping {rec.ticker} — OI {oi} < {MIN_OPEN_INTEREST}")
+    dropped = len(top_recs) - len(liquid_recs)
+    if dropped:
+        logger.info(f"[Liquidity] Dropped {dropped} thin contracts (OI < {MIN_OPEN_INTEREST})")
+    top_recs = liquid_recs
 
     # Fetch news + fundamentals for top 20 only (Mac has no memory limits)
     for rec in top_recs[:20]:
