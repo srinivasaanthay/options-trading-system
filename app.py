@@ -358,14 +358,34 @@ _POSITIVE_WORDS = {'surge','soar','rally','gain','growth','profit','strong','reb
 _NEGATIVE_WORDS = {'crash','collapse','plunge','plummet','decline','weak','miss','loss','bearish',
                    'downgrade','disappointing','crisis','recession','failure','drop','poor'}
 
+_news_client = None  # lazy, cached — same Alpaca credentials already used everywhere else
+
+
+def _get_news_client():
+    global _news_client
+    if _news_client is None and _ALPACA_KEY and _ALPACA_SECRET:
+        try:
+            from alpaca.data.historical.news import NewsClient
+            _news_client = NewsClient(_ALPACA_KEY, _ALPACA_SECRET)
+        except Exception as e:
+            logger.warning(f"[News] Could not init Alpaca news client: {e}")
+    return _news_client
+
+
 def _fetch_ticker_news(ticker: str) -> list:
-    """Fetch up to 5 recent headlines for a ticker via yfinance. Display-only, not used in scoring."""
+    """Fetch up to 5 recent headlines for a ticker via Alpaca (switched from
+    yfinance — its news endpoint was failing frequently, ~28 errors/day).
+    Display-only, not used in scoring."""
     try:
-        import yfinance as yf
-        items = yf.Ticker(ticker).news or []
+        from alpaca.data.requests import NewsRequest
+        client = _get_news_client()
+        if client is None:
+            return []
+        req = NewsRequest(symbols=ticker, limit=5)
+        items = client.get_news(req).data.get('news', [])
         result = []
         for item in items[:5]:
-            title = item.get('title', '') or ''
+            title = item.headline or ''
             words = set(title.lower().split())
             pos = len(words & _POSITIVE_WORDS)
             neg = len(words & _NEGATIVE_WORDS)
@@ -377,8 +397,8 @@ def _fetch_ticker_news(ticker: str) -> list:
                 sentiment = 'neutral'
             result.append({
                 'title': title,
-                'publisher': item.get('publisher', ''),
-                'published_at': item.get('providerPublishTime', 0),
+                'publisher': item.source or '',
+                'published_at': int(item.created_at.timestamp()) if item.created_at else 0,
                 'sentiment': sentiment,
             })
         return result
