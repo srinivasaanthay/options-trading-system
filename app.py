@@ -597,7 +597,11 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # Fetch real prices + OHLCV for all tickers up front (one batch call each)
     loop = asyncio.get_event_loop()
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
-    await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, tickers)
+    # SPY must be cached too — rs_vs_spy (25% of the composite score) reads it
+    # from _ohlcv_cache directly and silently defaults to 0.0 if it's missing,
+    # which it always was since SPY isn't one of the 500 scanned tickers.
+    prefetch_list = tickers if 'SPY' in tickers else tickers + ['SPY']
+    await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, prefetch_list)
 
     recs: List[OptionsRecommendation] = []
 
