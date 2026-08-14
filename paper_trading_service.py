@@ -204,6 +204,15 @@ class PaperTradingService:
             return "unknown"
         return "call" if m.group(1) == "C" else "put"
 
+    @staticmethod
+    def _is_occ_option_symbol(symbol: str) -> bool:
+        """True for standard OCC option symbols (e.g. 'TSEM260904C00265000'),
+        False for plain stock tickers. The same Alpaca account holds both
+        stock_trading_service and paper_trading_service orders, so this
+        distinguishes them before applying the options contract multiplier."""
+        import re
+        return bool(re.match(r"^[A-Z]+\d{6}[CP]\d{8}$", symbol))
+
     def get_realized_stats(self, limit: int = 500) -> Dict:
         """Reconstruct closed round-trip trades from Alpaca's own filled-order
         history, matching buys to sells FIFO per contract symbol.
@@ -228,15 +237,17 @@ class PaperTradingService:
 
             remaining = qty
             lots = open_lots.get(symbol, [])
+            is_option = self._is_occ_option_symbol(symbol)
+            multiplier = self.OPTION_MULTIPLIER if is_option else 1.0
             while remaining > 0 and lots:
                 lot = lots[0]
                 matched = min(remaining, lot["qty"])
-                pnl = (price - lot["price"]) * matched * self.OPTION_MULTIPLIER
+                pnl = (price - lot["price"]) * matched * multiplier
                 closed_trades.append({
                     "symbol": symbol, "qty": matched,
                     "entry_price": lot["price"], "exit_price": price,
                     "pnl": round(pnl, 2),
-                    "type": self._occ_option_type(symbol),
+                    "type": self._occ_option_type(symbol) if is_option else "stock",
                 })
                 lot["qty"] -= matched
                 remaining -= matched
