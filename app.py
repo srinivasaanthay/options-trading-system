@@ -507,6 +507,34 @@ _last_snapshot_date: Optional[str]  = None  # ET date of last saved snapshot (cl
 # SP500 SCHEDULER (background task)
 # ============================================================================
 
+GAP_RISK_PCT = 0.07  # already-moved-this-much-since-last-close is treated as "something happened"
+
+
+def _fetch_prev_closes_batch(tickers: List[str]) -> Dict[str, float]:
+    """Previous session's close per ticker, via the same Alpaca snapshot data
+    _fetch_prices_batch already pulls current prices from. Used as an
+    earnings/news-agnostic gap check — the earnings-date lookup is unreliable
+    exactly around the event itself (see _fetch_earnings_date), but a large
+    already-happened gap is a reliable signal regardless of the cause."""
+    prev_closes: Dict[str, float] = {}
+    if not (_ALPACA_KEY and _ALPACA_SECRET):
+        return prev_closes
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+        chunk_size = 500
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
+            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+            for sym, snap in snaps.items():
+                if snap.previous_daily_bar and snap.previous_daily_bar.close:
+                    prev_closes[sym] = float(snap.previous_daily_bar.close)
+    except Exception as e:
+        logger.warning(f"[Gap check] Previous close fetch failed: {e}")
+    return prev_closes
+
+
 def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
     """Fetch real-time mid-prices via Alpaca snapshots. Falls back to yfinance on failure."""
     prices: Dict[str, float] = {}
@@ -597,6 +625,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # Fetch real prices + OHLCV for all tickers up front (one batch call each)
     loop = asyncio.get_event_loop()
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
+    prev_close_map = await loop.run_in_executor(None, _fetch_prev_closes_batch, tickers)
     # SPY must be cached too — rs_vs_spy (25% of the composite score) reads it
     # from _ohlcv_cache directly and silently defaults to 0.0 if it's missing,
     # which it always was since SPY isn't one of the 500 scanned tickers.
@@ -604,6 +633,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, prefetch_list)
 
     recs: List[OptionsRecommendation] = []
+    gap_skipped = 0
 
     for idx, ticker in enumerate(tickers, 1):
         try:
@@ -614,6 +644,20 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             price = price_map.get(ticker) or _fallback_price(ticker)
             if not price or price <= 0:
                 continue
+
+            # Gap check — catches earnings/news moves the (unreliable, esp.
+            # right around the event) earnings-date lookup below can miss.
+            # COHR's -14% earnings-day drop on 2026-08-13 slipped through
+            # with days_to_earnings misreported as 999; this doesn't depend
+            # on knowing *why* the move happened, just that it already did.
+            prev_close = prev_close_map.get(ticker)
+            if prev_close and prev_close > 0:
+                gap = abs(price - prev_close) / prev_close
+                if gap > GAP_RISK_PCT:
+                    gap_skipped += 1
+                    logger.debug("[SP500] %s skipped — already gapped %.1f%% since last close",
+                                 ticker, gap * 100)
+                    continue
 
             result = await stock_agent.analyze_ticker(ticker, float(price))
 
@@ -665,7 +709,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
 
-    logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept")
+    logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept"
+                + (f" ({gap_skipped} skipped — already gapped >{GAP_RISK_PCT*100:.0f}%)" if gap_skipped else ""))
 
     # Save hourly snapshot — market hours only, reset each trading day
     global hourly_snapshots, _last_snapshot_hour, _last_snapshot_date
