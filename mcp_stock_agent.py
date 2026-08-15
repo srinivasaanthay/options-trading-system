@@ -8,6 +8,7 @@ Integrates with existing analyzer framework.
 import asyncio
 import json
 import logging
+import os
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -794,18 +795,21 @@ class MCPStockAgent:
         }
 
         try:
-            import yfinance as yf
-            articles = yf.Ticker(ticker).news or []
+            # Alpaca, not yfinance — yfinance's news endpoint was failing
+            # frequently (~30 errors/day) and always fell through to the
+            # price-momentum fallback below. Same credentials used everywhere
+            # else in this system.
+            from alpaca.data.historical.news import NewsClient
+            from alpaca.data.requests import NewsRequest
+            client = NewsClient(os.environ.get('ALPACA_API_KEY', ''), os.environ.get('ALPACA_API_SECRET', ''))
+            req = NewsRequest(symbols=ticker, limit=15)
+            articles = client.get_news(req).data.get('news', [])
             if not articles:
                 raise ValueError("no articles")
 
             bullish = bearish = 0
             for article in articles[:15]:
-                # yfinance >= 0.2.x nests title inside content dict
-                content = article.get('content', {})
-                title = (content.get('title') or
-                         content.get('description') or
-                         article.get('title') or '')
+                title = article.headline or ''
                 if not title:
                     continue
                 # Skip obvious macro/index headlines — they inflate all tickers equally.
