@@ -1037,6 +1037,7 @@ async def push_sp500_results(
                 days_to_earnings=r.get("days_to_earnings", 999),
                 analyst_upside=r.get("analyst_upside", 0.0),
                 fundamentals=r.get("fundamentals", {}),
+                news_headlines=r.get("news_headlines", []),
             ))
         except Exception as e:
             logger.warning(f"Skipping bad rec: {e}")
