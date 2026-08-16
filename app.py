@@ -280,6 +280,100 @@ def _check_open_interest(ticker: str, strike: float, expiry: str, action: str) -
         return None
 
 
+COVERED_CALL_DEFAULT_BUDGET = 5000.0  # 100 shares must fit in this to be a candidate
+
+_option_quote_client = None  # lazy, cached — separate client, options quotes need
+                              # OptionHistoricalDataClient, not the trading client above
+
+
+def _get_option_quote_client():
+    global _option_quote_client
+    if _option_quote_client is None and _ALPACA_KEY and _ALPACA_SECRET:
+        try:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            _option_quote_client = OptionHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+        except Exception as e:
+            logger.warning(f"[CoveredCall] Could not init option quote client: {e}")
+    return _option_quote_client
+
+
+def _find_covered_call_candidates(budget: float = COVERED_CALL_DEFAULT_BUDGET) -> List[Dict]:
+    """From the latest scored CALL recs, find ones where 100 shares fits the
+    budget, then find a real liquid slightly-OTM call to sell against them —
+    analysis only, this does not place any order. Strike target mirrors the
+    pattern seen in real covered-call trades: ~3-10% above current price."""
+    candidates: List[Dict] = []
+    trading_client = _get_liquidity_client()
+    quote_client = _get_option_quote_client()
+    if trading_client is None or quote_client is None:
+        return candidates
+
+    eligible = [r for r in latest_options_recs
+                if r.action == "CALL" and r.current_price > 0 and r.current_price * 100 <= budget]
+
+    for rec in eligible:
+        try:
+            from alpaca.trading.requests import GetOptionContractsRequest
+            from alpaca.trading.enums import ContractType
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            price = rec.current_price
+            expiry = _next_monthly_expiry()
+            req = GetOptionContractsRequest(
+                underlying_symbols=[rec.ticker],
+                expiration_date_gte=datetime.strptime(expiry, "%Y-%m-%d").date(),
+                expiration_date_lte=datetime.strptime(expiry, "%Y-%m-%d").date(),
+                type=ContractType.CALL,
+                strike_price_gte=str(round(price * 1.03, 2)),
+                strike_price_lte=str(round(price * 1.10, 2)),
+            )
+            resp = trading_client.get_option_contracts(req)
+            contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
+            liquid = [c for c in contracts if c.open_interest and int(c.open_interest) >= MIN_OPEN_INTEREST]
+            if not liquid:
+                continue
+
+            target = price * 1.05
+            contract = min(liquid, key=lambda c: abs(float(c.strike_price) - target))
+
+            quote = quote_client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=contract.symbol)
+            ).get(contract.symbol)
+            if not quote:
+                continue
+            bid = float(quote.bid_price or 0)
+            ask = float(quote.ask_price or 0)
+            if bid <= 0:
+                continue
+            premium = (bid + ask) / 2 if ask > 0 else bid
+
+            shares_cost = round(price * 100, 2)
+            premium_total = round(premium * 100, 2)
+            strike = float(contract.strike_price)
+
+            candidates.append({
+                "ticker": rec.ticker,
+                "score": rec.score,
+                "buy_signal": rec.buy_signal,
+                "current_price": round(price, 2),
+                "shares_cost": shares_cost,
+                "strike": strike,
+                "expiry_date": expiry,
+                "premium_per_share": round(premium, 2),
+                "premium_total": premium_total,
+                "yield_pct": round(premium_total / shares_cost * 100, 2),
+                "breakeven": round(price - premium, 2),
+                "max_profit_if_called": round((strike - price) * 100 + premium_total, 2),
+                "open_interest": int(contract.open_interest or 0),
+            })
+        except Exception as e:
+            logger.debug(f"[CoveredCall] {rec.ticker} skipped: {e}")
+            continue
+
+    candidates.sort(key=lambda c: -c["yield_pct"])
+    return candidates
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring."""
     is_bearish = (analysis_result.technical_score < 0.48 or
@@ -988,6 +1082,31 @@ async def get_sp500_options_recommendations(
         "count": len(recs),
         "next_refresh_in_minutes": 20,
         "recommendations": [asdict(r) for r in recs],
+    }
+
+
+@app.get("/api/v1/covered-calls/candidates")
+async def get_covered_call_candidates(
+    budget: float = COVERED_CALL_DEFAULT_BUDGET,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """
+    Covered-call candidates: from the latest scored CALL recs, only tickers
+    cheap enough that 100 shares fits your budget, paired with a real liquid
+    slightly-OTM call and its actual current premium.
+
+    Analysis only — this does not buy shares or sell any option. You still
+    place the trade yourself (buy 100 shares, then sell the shown contract).
+    """
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    loop = asyncio.get_event_loop()
+    candidates = await loop.run_in_executor(None, _find_covered_call_candidates, budget)
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "budget": budget,
+        "count": len(candidates),
+        "candidates": candidates,
     }
 
 
