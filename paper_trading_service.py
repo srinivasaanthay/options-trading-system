@@ -87,6 +87,16 @@ class PaperTradingService:
     OPTION_MULTIPLIER   = 100.0     # contract-to-share multiplier for standard equity options
     MIN_OPEN_INTEREST   = 1000      # below this, contracts are too thin to trade reliably
 
+    # Real standing stop/target orders placed on the OPTION premium itself at
+    # entry time — not the STOP_LOSS_PCT/TAKE_PROFIT_PCT underlying-move check
+    # above, which only fires when a scan happens to run. A position opened
+    # Friday afternoon gets zero protection all weekend under that check (see
+    # the Aug 14->17 batch: held 70+ hours against a 24h rule, no scan to
+    # notice). These orders sit with Alpaca directly and can fire any time
+    # the market's open, including the instant Monday opens.
+    OPTION_STOP_PCT     = 0.40      # sell if premium drops 40% from entry
+    OPTION_TARGET_PCT    = 0.60      # sell if premium rises 60% from entry
+
     def __init__(self, api_key: str, api_secret: str):
         self.api_key    = api_key
         self.api_secret = api_secret
@@ -432,6 +442,54 @@ class PaperTradingService:
             logger.error("[PaperTrading] _find_option_contract %s %s: %s", action, ticker, e)
             return None
 
+    def _wait_for_fill(self, order_id, timeout_secs: float = 8.0) -> bool:
+        """Poll briefly for a buy order to fill before placing protective
+        orders against it — Alpaca will reject a sell-to-close on shares/
+        contracts not yet owned. Liquid, already OI-filtered contracts at
+        a mid-price limit fill almost immediately in practice."""
+        import time as _time
+        from alpaca.trading.enums import OrderStatus
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            try:
+                current = self.client.get_order_by_id(order_id)
+                if current.status == OrderStatus.FILLED:
+                    return True
+                if current.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    return False
+            except Exception:
+                pass
+            _time.sleep(0.5)
+        return False
+
+    def _place_protective_orders(self, option_symbol: str, entry_price: float) -> None:
+        """Place real standing stop-loss and take-profit sell orders on the
+        option contract itself, right after the buy fills — see
+        OPTION_STOP_PCT/OPTION_TARGET_PCT for why this exists instead of
+        relying solely on the scan-based _close_expired_positions check."""
+        try:
+            from alpaca.trading.requests import StopOrderRequest, LimitOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+
+            stop_price   = round(entry_price * (1 - self.OPTION_STOP_PCT), 2)
+            target_price = round(entry_price * (1 + self.OPTION_TARGET_PCT), 2)
+
+            self.client.submit_order(StopOrderRequest(
+                symbol=option_symbol, qty=1, side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC, stop_price=max(stop_price, 0.01),
+            ))
+            self.client.submit_order(LimitOrderRequest(
+                symbol=option_symbol, qty=1, side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC, limit_price=target_price,
+            ))
+            logger.info(
+                "[PaperTrading] Protective orders for %s: stop=$%.2f target=$%.2f (entry $%.2f)",
+                option_symbol, stop_price, target_price, entry_price,
+            )
+        except Exception as e:
+            # Not fatal — _close_expired_positions is still a fallback net
+            logger.warning("[PaperTrading] Could not place protective orders for %s: %s", option_symbol, e)
+
     def _place_option_order(
         self, ticker: str, action: str, price: float, score: float
     ) -> Optional[Dict]:
@@ -474,6 +532,15 @@ class PaperTradingService:
             )
             logger.info("[PaperTrading] Limit order at $%.2f (mid) for %s", limit_price, contract.symbol)
             order = self.client.submit_order(order_req)
+
+            if self._wait_for_fill(order.id):
+                self._place_protective_orders(contract.symbol, limit_price)
+            else:
+                logger.warning(
+                    "[PaperTrading] %s buy not confirmed filled — skipping protective orders, "
+                    "_close_expired_positions will still catch it on the next scan",
+                    contract.symbol,
+                )
 
             direction   = "LONG" if action == "CALL" else "SHORT"
             stop_loss   = price * (1 - self.STOP_LOSS_PCT)   if action == "CALL" else price * (1 + self.STOP_LOSS_PCT)
@@ -529,8 +596,26 @@ class PaperTradingService:
             ))
             return None
 
+    def _cancel_open_orders_for(self, symbol: str) -> None:
+        """Cancel any still-open orders on this symbol — used to clear the
+        dangling stop or target order once the other one of the pair has
+        already filled (they're separate orders, not a linked OCO pair)."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            open_orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+            for o in open_orders:
+                self.client.cancel_order_by_id(o.id)
+        except Exception as e:
+            logger.debug("[PaperTrading] Cancel dangling orders for %s failed: %s", symbol, e)
+
     def _close_expired_positions(self) -> None:
-        """Sell any options positions that have hit stop/take-profit or exceeded HOLD_HOURS."""
+        """Sell any options positions that have hit stop/take-profit or exceeded HOLD_HOURS.
+
+        First syncs against Alpaca directly — a standing stop or target order
+        (placed at entry, see _place_protective_orders) may have already
+        closed the position on its own, any time the market was open,
+        independent of whether a scan happened to be running to notice."""
         if not self.connected:
             return
         try:
@@ -538,27 +623,42 @@ class PaperTradingService:
             now = datetime.now(timezone.utc)
 
             for trade in open_trades:
+                if not self._has_open_alpaca_position(trade.option_symbol):
+                    # A standing protective order already closed this — sync
+                    # our bookkeeping and clear whichever order didn't fire.
+                    self._cancel_open_orders_for(trade.option_symbol)
+                    trade.status = "closed"
+                    trade.exit_time = datetime.utcnow().isoformat()
+                    trade.notes = "closed_by_standing_order"
+                    logger.info(
+                        "[PaperTrading] %s already closed by its standing stop/target order",
+                        trade.option_symbol,
+                    )
+                    continue
+
                 entry_dt = datetime.fromisoformat(trade.entry_time.replace("Z", "+00:00"))
                 if entry_dt.tzinfo is None:
                     entry_dt = entry_dt.replace(tzinfo=timezone.utc)
                 age_hours = (now - entry_dt).total_seconds() / 3600
 
-                # Use Alpaca real-time price (not delayed yfinance)
-                current = self._get_realtime_price(trade.ticker) or trade.entry_price
-
-                hit_stop   = (trade.direction == "LONG"  and current <= trade.stop_loss) or \
-                             (trade.direction == "SHORT" and current >= trade.stop_loss)
-                hit_target = (trade.direction == "LONG"  and current >= trade.take_profit) or \
-                             (trade.direction == "SHORT" and current <= trade.take_profit)
-
-                if age_hours >= self.HOLD_HOURS or hit_stop or hit_target:
-                    reason = ("expired"     if age_hours >= self.HOLD_HOURS
-                              else "stop_loss"  if hit_stop
-                              else "take_profit")
-                    self._close_option_position(trade, current, reason)
+                if age_hours >= self.HOLD_HOURS:
+                    # Time-based exit only — price-based stop/target now live
+                    # as real standing orders, not checked here anymore.
+                    current = self._get_realtime_price(trade.ticker) or trade.entry_price
+                    self._cancel_open_orders_for(trade.option_symbol)
+                    self._close_option_position(trade, current, "expired")
 
         except Exception as e:
             logger.error("[PaperTrading] _close_expired_positions failed: %s", e)
+
+    def _has_open_alpaca_position(self, symbol: str) -> bool:
+        """True if Alpaca still shows an open (nonzero qty) position for this symbol."""
+        try:
+            pos = self.client.get_open_position(symbol)
+            return float(pos.qty) != 0
+        except Exception:
+            # get_open_position raises when there's no position for the symbol
+            return False
 
     def _close_option_position(self, trade: TradeRecord, current_price: float, reason: str) -> None:
         """Sell an options contract and record the trade outcome."""
