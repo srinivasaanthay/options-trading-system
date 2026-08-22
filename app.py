@@ -40,6 +40,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Tuple
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from zoneinfo import ZoneInfo
 
@@ -749,6 +750,25 @@ def _fallback_price(ticker: str) -> float:
     return 0.0
 
 
+# Bounded concurrency for per-ticker analysis. analyze_ticker() is `async def`
+# but its internals (yfinance options-chain/fundamentals/earnings lookups)
+# are all plain blocking calls with no real `await` inside — so scanning
+# tickers one at a time via a straight `await` loop never overlapped any of
+# that I/O, which is why a scan could take 10+ minutes once the 20-min
+# options-chain cache expired. Running it through a real thread pool lets
+# up to ANALYZE_CONCURRENCY tickers' worth of blocking yfinance/Alpaca calls
+# be in flight at once. Kept modest (not e.g. 50+) because yfinance has no
+# official rate limit and aggressive concurrency risks Yahoo throttling.
+ANALYZE_CONCURRENCY = 8
+_ANALYZE_EXECUTOR = ThreadPoolExecutor(max_workers=ANALYZE_CONCURRENCY, thread_name_prefix="analyze")
+
+
+def _analyze_ticker_sync(ticker: str, price: float):
+    """Thread-pool entry point — analyze_ticker has no internal awaits, so a
+    fresh event loop per call is cheap and safe (no other loop touches this thread)."""
+    return asyncio.run(stock_agent.analyze_ticker(ticker, price))
+
+
 async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     """Analyze top 500 liquid US stocks, return top options recommendations."""
     global latest_options_recs, last_sp500_run
@@ -774,32 +794,49 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     recs: List[OptionsRecommendation] = []
     gap_skipped = 0
 
-    for idx, ticker in enumerate(tickers, 1):
+    # Pass 1 — cheap, in-memory filtering only (no network calls), sequential.
+    candidates: List[Tuple[str, float]] = []
+    for ticker in tickers:
+        # Skip tickers that have no real OHLCV data (delisted / bankrupt)
+        if ticker not in stock_agent._ohlcv_cache:
+            continue
+
+        price = price_map.get(ticker) or _fallback_price(ticker)
+        if not price or price <= 0:
+            continue
+
+        # Gap check — catches earnings/news moves the (unreliable, esp.
+        # right around the event) earnings-date lookup below can miss.
+        # COHR's -14% earnings-day drop on 2026-08-13 slipped through
+        # with days_to_earnings misreported as 999; this doesn't depend
+        # on knowing *why* the move happened, just that it already did.
+        prev_close = prev_close_map.get(ticker)
+        if prev_close and prev_close > 0:
+            gap = abs(price - prev_close) / prev_close
+            if gap > GAP_RISK_PCT:
+                gap_skipped += 1
+                logger.debug("[SP500] %s skipped — already gapped %.1f%% since last close",
+                             ticker, gap * 100)
+                continue
+
+        candidates.append((ticker, float(price)))
+
+    # Pass 2 — the expensive part, run concurrently across a thread pool.
+    async def _analyze_one(ticker: str, price: float):
         try:
-            # Skip tickers that have no real OHLCV data (delisted / bankrupt)
-            if ticker not in stock_agent._ohlcv_cache:
-                continue
+            result = await loop.run_in_executor(_ANALYZE_EXECUTOR, _analyze_ticker_sync, ticker, price)
+            return ticker, price, result, None
+        except Exception as e:
+            return ticker, price, None, e
 
-            price = price_map.get(ticker) or _fallback_price(ticker)
-            if not price or price <= 0:
-                continue
+    analyzed = await asyncio.gather(*[_analyze_one(t, p) for t, p in candidates])
 
-            # Gap check — catches earnings/news moves the (unreliable, esp.
-            # right around the event) earnings-date lookup below can miss.
-            # COHR's -14% earnings-day drop on 2026-08-13 slipped through
-            # with days_to_earnings misreported as 999; this doesn't depend
-            # on knowing *why* the move happened, just that it already did.
-            prev_close = prev_close_map.get(ticker)
-            if prev_close and prev_close > 0:
-                gap = abs(price - prev_close) / prev_close
-                if gap > GAP_RISK_PCT:
-                    gap_skipped += 1
-                    logger.debug("[SP500] %s skipped — already gapped %.1f%% since last close",
-                                 ticker, gap * 100)
-                    continue
-
-            result = await stock_agent.analyze_ticker(ticker, float(price))
-
+    # Pass 3 — cheap, in-memory scoring/filtering over the results, sequential.
+    for idx, (ticker, price, result, err) in enumerate(analyzed, 1):
+        if err is not None:
+            logger.debug(f"[SP500] {ticker} skipped: {err}")
+            continue
+        try:
             # Skip if earnings are ≤3 days away — IV crush kills option buyers
             if result.days_to_earnings <= 3:
                 logger.debug("[SP500] %s skipped — earnings in %d days",
@@ -810,12 +847,12 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             is_bullish = result.technical_score >= 0.55
             is_bearish = result.technical_score <= 0.45
             if is_bullish or is_bearish:
-                rec = _make_options_rec(ticker, result, float(price))
+                rec = _make_options_rec(ticker, result, price)
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
             if idx % 100 == 0:
-                logger.info(f"[SP500] Progress {idx}/{len(SP500_TICKERS)}")
+                logger.info(f"[SP500] Progress {idx}/{len(analyzed)}")
 
         except Exception as e:
             logger.debug(f"[SP500] {ticker} skipped: {e}")
