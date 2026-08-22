@@ -176,6 +176,7 @@ class OptionsRecommendation:
     rs_vs_spy: float = 0.0
     days_to_earnings: int = 999
     analyst_upside: float = 0.0
+    long_term_score: float = 0.0  # weeks-to-months stock ranking — see _compute_long_term_score
     news_headlines: list = None  # display-only, not used in scoring
     fundamentals: dict = None    # balance sheet, cash flow, income — top 20 only
 
@@ -374,6 +375,27 @@ def _find_covered_call_candidates(budget: float = COVERED_CALL_DEFAULT_BUDGET) -
     return candidates
 
 
+def _compute_long_term_score(tech: float, rs_score: float, fund: float, analyst_upside: float, is_bearish: bool) -> float:
+    """Weeks-to-months stock ranking — deliberately different weighting from
+    the options composite score above. Fundamentals and analyst upside carry
+    most of the weight here since they matter for holding a stock over weeks/
+    months; IV rank is excluded entirely (it's an options-pricing signal,
+    meaningless for a long-term stock decision) and short-term volume isn't
+    used either (noise at this horizon, not signal)."""
+    upside_score = min(1.0, max(0.0, analyst_upside / 30.0))  # +30% target -> 1.0
+    if is_bearish:
+        raw = ((1.0 - fund)         * 0.40 +
+               (1.0 - upside_score) * 0.25 +
+               (1.0 - tech)         * 0.25 +
+               (1.0 - rs_score)     * 0.10)
+    else:
+        raw = (fund         * 0.40 +
+               upside_score * 0.25 +
+               tech         * 0.25 +
+               rs_score     * 0.10)
+    return round(min(1.0, max(0.0, raw)), 4)
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring."""
     is_bearish = (analysis_result.technical_score < 0.48 or
@@ -388,6 +410,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
     vol_ratio   = getattr(analysis_result, 'volume_ratio', 1.0)
     rs          = getattr(analysis_result, 'rs_vs_spy', 0.0)
     fund        = getattr(analysis_result, 'fundamental_score', 0.5)
+    upside      = getattr(analysis_result, 'analyst_upside', 0.0)
 
     # Normalise volume: 0.3× avg → 0.0,  1.0× avg → 0.5,  2.0× avg → 1.0
     vol_score = min(1.0, max(0.0, vol_ratio / 2.0))
@@ -418,6 +441,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
 
     score = round(min(1.0, max(0.0, raw)), 4)
     confidence, buy_signal = _interpret_composite_score(score)
+    long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
@@ -444,6 +468,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
         rs_vs_spy=round(getattr(analysis_result, 'rs_vs_spy', 0.0), 2),
         days_to_earnings=getattr(analysis_result, 'days_to_earnings', 999),
         analyst_upside=round(getattr(analysis_result, 'analyst_upside', 0.0), 1),
+        long_term_score=long_term_score,
     )
 
 
@@ -1155,6 +1180,7 @@ async def push_sp500_results(
                 rs_vs_spy=r.get("rs_vs_spy", 0.0),
                 days_to_earnings=r.get("days_to_earnings", 999),
                 analyst_upside=r.get("analyst_upside", 0.0),
+                long_term_score=r.get("long_term_score", 0.0),
                 fundamentals=r.get("fundamentals", {}),
                 news_headlines=r.get("news_headlines", []),
             ))
@@ -1706,12 +1732,16 @@ async def get_stock_signals(
     limit: int = 20,
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ):
-    """Latest bullish stock signals from SP500 scan (CALL recs with score >= min_score)."""
+    """Long-term-ranked bullish stock signals (weeks-to-months horizon) from
+    the same scanned pool as the options recs, but sorted by long_term_score
+    (fundamentals/analyst-upside/trend weighted) instead of the short-term,
+    options-focused score — see _compute_long_term_score. min_score is
+    checked against long_term_score here, not the options score."""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
     recs = [r for r in latest_options_recs
-            if r.action == "CALL" and r.score >= min_score]
-    recs = sorted(recs, key=lambda r: r.score, reverse=True)[:limit]
+            if r.action == "CALL" and r.long_term_score >= min_score]
+    recs = sorted(recs, key=lambda r: r.long_term_score, reverse=True)[:limit]
     return {
         "timestamp": datetime.utcnow().isoformat(),
         "last_scan": last_sp500_run.isoformat() if last_sp500_run else None,
