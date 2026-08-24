@@ -884,6 +884,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
+    _save_results()  # survive a Railway restart mid-day, same as pushed results already did
 
     logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept"
                 + (f" ({gap_skipped} skipped — already gapped >{GAP_RISK_PCT*100:.0f}%)" if gap_skipped else ""))
@@ -931,13 +932,52 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     return latest_options_recs
 
 
+SP500_SCAN_INTERVAL = 5 * 60  # matches local_runner.py's cadence
+
+
 async def _sp500_scheduler_loop():
-    """Background loop: analyze SP500 every 20 minutes, push to WebSocket clients."""
-    # Wait for server to come up healthy before first scan
-    await asyncio.sleep(30)
+    """Background loop replacing local_runner.py — runs the full SP500 scan
+    directly on Railway instead of relying on a push from the Mac. Mirrors
+    local_runner's market-hours gating (9:25 AM-4:05 PM ET weekdays, first
+    scan waits for 9:31 options open) and the stale-position cleanup +
+    stock-trade execution it used to trigger via HTTP self-calls — done as
+    direct in-process calls here since this now runs in the same process.
+    _analyze_sp500_options() already executes paper (options) trades
+    internally; stock trading does not, so it's triggered explicitly below."""
+    await asyncio.sleep(30)  # let server come up healthy first
+    first_scan_done = False
+
     while True:
+        now_et = datetime.now(_ET)
+        is_weekday = now_et.weekday() < 5
+        session_start = now_et.replace(hour=9, minute=25, second=0, microsecond=0)
+        session_end   = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+        options_open  = now_et.replace(hour=9, minute=31, second=0, microsecond=0)
+
+        if not is_weekday or now_et < session_start or now_et >= session_end:
+            first_scan_done = False
+            await asyncio.sleep(300)  # re-check every 5 min rather than sleeping for hours —
+            continue                  # Railway runs 24/7 anyway, unlike the Mac's caffeinate setup
+
+        if not first_scan_done:
+            if now_et < options_open:
+                await asyncio.sleep((options_open - now_et).total_seconds())
+                continue
+            if paper_trader and paper_trader.connected:
+                try:
+                    loop = asyncio.get_event_loop()
+                    all_positions = await loop.run_in_executor(None, paper_trader.client.get_all_positions)
+                    tracked = {t.option_symbol for t in paper_trader.trade_history if t.option_symbol}
+                    for p in all_positions:
+                        if p.symbol not in tracked:
+                            await loop.run_in_executor(None, paper_trader.client.close_position, p.symbol)
+                            logger.info("[Scheduler] Closed stale position %s", p.symbol)
+                except Exception as e:
+                    logger.warning(f"[Scheduler] close-stale failed: {e}")
+            first_scan_done = True
+
         try:
-            recs = await _analyze_sp500_options()
+            recs = await _analyze_sp500_options()  # also executes paper trades internally
 
             # Push to all connected WebSocket clients
             if options_ws_connections and recs:
@@ -956,11 +996,22 @@ async def _sp500_scheduler_loop():
                 for ws in dead:
                     options_ws_connections.remove(ws)
 
+            # Stock trading — not handled inside _analyze_sp500_options, so
+            # trigger it explicitly the same way local_runner.py used to.
+            if stock_trader and stock_trader.connected and _is_market_open() and recs:
+                try:
+                    loop = asyncio.get_event_loop()
+                    rec_dicts = [asdict(r) for r in recs]
+                    results = await loop.run_in_executor(None, stock_trader.execute_signals, rec_dicts)
+                    if results:
+                        logger.info(f"[Scheduler] Stock trades executed: {len(results)}")
+                except Exception as e:
+                    logger.warning(f"[Scheduler] stock trade execution failed: {e}")
+
         except Exception as e:
             logger.error(f"[SP500 Scheduler] Error: {e}")
 
-        # Wait 20 minutes before next run
-        await asyncio.sleep(20 * 60)
+        await asyncio.sleep(SP500_SCAN_INTERVAL)
 
 
 # ============================================================================
