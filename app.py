@@ -1465,6 +1465,23 @@ async def trigger_sp500_analysis(
 # PHASE 3A: ANALYSIS ENDPOINTS
 # ============================================================================
 
+@app.get("/api/v1/quote/{ticker}")
+async def get_quote(
+    ticker: str,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Real current price for a single ticker — lets the app auto-fill a
+    price instead of the user having to already know it and drag a slider
+    to guess it (the Analysis tab's old behavior)."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    loop = asyncio.get_event_loop()
+    price = await loop.run_in_executor(None, _fallback_price, ticker.upper())
+    if not price or price <= 0:
+        raise HTTPException(status_code=404, detail=f"No price available for {ticker.upper()}")
+    return {"ticker": ticker.upper(), "price": round(price, 2)}
+
+
 @app.post("/api/v1/analyze")
 async def analyze_stock(
     symbol: str,
