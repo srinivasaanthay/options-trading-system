@@ -182,6 +182,7 @@ class OptionsRecommendation:
     fundamentals: dict = None    # balance sheet, cash flow, income — top 20 only
     catalyst_age_days: int = -1        # days since the most recent headline; -1 = no news found
     price_change_since_catalyst: float = 0.0  # % move since that headline — see _compute_catalyst_freshness
+    intraday_move_pct: float = 0.0     # % faded off today's high (CALL) or bounced off today's low (PUT)
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -399,8 +400,12 @@ def _compute_long_term_score(tech: float, rs_score: float, fund: float, analyst_
     return round(min(1.0, max(0.0, raw)), 4)
 
 
-def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsRecommendation:
-    """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring."""
+def _make_options_rec(ticker: str, analysis_result, price: float,
+                       today_high: float = None, today_low: float = None) -> OptionsRecommendation:
+    """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
+    today_high/today_low (optional — from _fetch_intraday_extremes_batch) let a same-day
+    reversal dampen the score even though the technical component below is daily-bar-based
+    and can't see it on its own."""
     is_bearish = (analysis_result.technical_score < 0.48 or
                   analysis_result.buy_signal in [BuySignal.HOLD, BuySignal.AVOID])
     action = "PUT" if is_bearish else "CALL"
@@ -443,6 +448,23 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
                fund      * 0.10)
 
     score = round(min(1.0, max(0.0, raw)), 4)
+
+    # ── Same-day reversal penalty ──────────────────────────────────────────
+    # A CALL that's already faded well off today's own high (or a PUT that's
+    # already bounced well off today's own low) is chasing a move that's
+    # reversing right now, in real time — the daily-bar technical score
+    # above can't see that on its own. Penalty is capped at 15 points so a
+    # single intraday wiggle can't wipe out an otherwise-strong signal.
+    intraday_move_pct = 0.0
+    if not is_bearish and today_high and today_high > 0 and price < today_high:
+        intraday_move_pct = round((price - today_high) / today_high * 100, 2)
+        if intraday_move_pct <= -1.5:
+            score = round(max(0.0, score - min(0.15, abs(intraday_move_pct) * 0.03)), 4)
+    elif is_bearish and today_low and today_low > 0 and price > today_low:
+        intraday_move_pct = round((price - today_low) / today_low * 100, 2)
+        if intraday_move_pct >= 1.5:
+            score = round(max(0.0, score - min(0.15, intraday_move_pct * 0.03)), 4)
+
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
@@ -472,6 +494,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float) -> OptionsReco
         days_to_earnings=getattr(analysis_result, 'days_to_earnings', 999),
         analyst_upside=round(getattr(analysis_result, 'analyst_upside', 0.0), 1),
         long_term_score=long_term_score,
+        intraday_move_pct=intraday_move_pct,
     )
 
 
@@ -730,6 +753,33 @@ def _fetch_prev_closes_batch(tickers: List[str]) -> Dict[str, float]:
     return prev_closes
 
 
+def _fetch_intraday_extremes_batch(tickers: List[str]) -> Dict[str, Tuple[float, float]]:
+    """Today's high/low so far per ticker, via the same Alpaca snapshot data
+    the price/gap batches already use. The technical score is built entirely
+    from daily bars, so it has no way to see a same-day reversal — a stock
+    that's already faded 4% off today's own high still scores as if today
+    were still at its open. This lets _make_options_rec apply a same-day
+    fade/bounce penalty the daily-bar technicals can't see on their own."""
+    extremes: Dict[str, Tuple[float, float]] = {}
+    if not (_ALPACA_KEY and _ALPACA_SECRET):
+        return extremes
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockSnapshotRequest
+        client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+        chunk_size = 500
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
+            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+            for sym, snap in snaps.items():
+                bar = snap.daily_bar
+                if bar and bar.high and bar.low:
+                    extremes[sym] = (float(bar.high), float(bar.low))
+    except Exception as e:
+        logger.warning(f"[Intraday extremes] Fetch failed: {e}")
+    return extremes
+
+
 def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
     """Fetch real-time mid-prices via Alpaca snapshots. Falls back to yfinance on failure."""
     prices: Dict[str, float] = {}
@@ -840,6 +890,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     loop = asyncio.get_event_loop()
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
     prev_close_map = await loop.run_in_executor(None, _fetch_prev_closes_batch, tickers)
+    intraday_extremes_map = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, tickers)
     # SPY must be cached too — rs_vs_spy (25% of the composite score) reads it
     # from _ohlcv_cache directly and silently defaults to 0.0 if it's missing,
     # which it always was since SPY isn't one of the 500 scanned tickers.
@@ -902,7 +953,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             is_bullish = result.technical_score >= 0.55
             is_bearish = result.technical_score <= 0.45
             if is_bullish or is_bearish:
-                rec = _make_options_rec(ticker, result, price)
+                t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
+                rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low)
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
@@ -1331,6 +1383,7 @@ async def push_sp500_results(
                 news_headlines=r.get("news_headlines", []),
                 catalyst_age_days=r.get("catalyst_age_days", -1),
                 price_change_since_catalyst=r.get("price_change_since_catalyst", 0.0),
+                intraday_move_pct=r.get("intraday_move_pct", 0.0),
             ))
         except Exception as e:
             logger.warning(f"Skipping bad rec: {e}")
