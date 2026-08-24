@@ -1485,94 +1485,55 @@ async def get_quote(
 @app.post("/api/v1/analyze")
 async def analyze_stock(
     symbol: str,
-    price: float,
+    price: float = 0.0,
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
+    """Full real-data analysis for a single ticker — runs the same pipeline
+    as the main SP500 scan (real technicals, real news, catalyst freshness,
+    same-day reversal awareness, long-term score) instead of the fixed
+    mock news/technical/options/market data this endpoint used before,
+    which returned a plausible-looking but entirely fabricated result
+    regardless of the actual ticker or price passed in."""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not stock_agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    if not all([news_analyzer, technical_analyzer, market_analyzer]):
-        raise HTTPException(status_code=503, detail="Analyzers not initialized")
-
+    ticker = symbol.upper()
     try:
-        news_data = {
-            'overall_sentiment': 0.3,
-            'strength': 0.7,
-            'recency_score': 0.8,
-            'trend': 'improving',
-            'news_count': 5
-        }
-        technical_data = {
-            'trend': 'uptrend',
-            'momentum': 45,
-            'strength': 0.75,
-            'technical_score': 65,
-            'support_resistance': {'support': price * 0.97, 'resistance': price * 1.03}
-        }
-        options_data = {
-            'calls': {
-                'recommendations': [
-                    {'strike': price, 'suitability': {'option_score': 75}},
-                    {'strike': price + 5, 'suitability': {'option_score': 70}}
-                ],
-                'avg_iv': 0.25
-            },
-            'puts': {
-                'recommendations': [
-                    {'strike': price, 'suitability': {'option_score': 55}},
-                    {'strike': price - 5, 'suitability': {'option_score': 50}}
-                ],
-                'avg_iv': 0.25
-            }
-        }
-        market_data = {
-            'trend': {'direction': 'uptrend'},
-            'volatility': {'regime': 'medium', 'vix': 18},
-            'health_score': 70,
-            'breadth': {'breadth_score': 0.75}
-        }
+        loop = asyncio.get_event_loop()
 
-        market_analysis = market_analyzer.analyze_market(market_data)
-        strategy_rec = strategy_selector.recommend_strategy(market_analysis, options_data, price)
-        ml_prediction = call_put_predictor.predict(
-            news_data, technical_data, options_data, market_analysis, price
-        )
-        reasoning = reasoning_generator.generate_reasoning(
-            symbol, news_data, technical_data, options_data, market_analysis,
-            strategy_rec['recommendations'][0] if strategy_rec.get('recommendations') else {},
-            ml_prediction, price
-        )
+        # Prefer the real current price over whatever the client sent —
+        # keeps this endpoint accurate even if the caller has a stale one.
+        real_price = await loop.run_in_executor(None, _fallback_price, ticker)
+        use_price = real_price if real_price and real_price > 0 else price
+        if not use_price or use_price <= 0:
+            raise HTTPException(status_code=404, detail=f"No price available for {ticker}")
 
-        # Build options details
-        action = ml_prediction.get('recommendation', 'neutral').upper()
-        if action not in ('CALL', 'PUT'):
-            action = 'CALL'
-        strike = _strike_for_action(price, action)
-        expiry = _next_monthly_expiry()
+        await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, [ticker, "SPY"])
+        extremes = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, [ticker])
+        t_high, t_low = extremes.get(ticker, (None, None))
+
+        result = await stock_agent.analyze_ticker(ticker, float(use_price))
+        rec = _make_options_rec(ticker, result, float(use_price), today_high=t_high, today_low=t_low)
+        rec.news_headlines = await loop.run_in_executor(None, _fetch_ticker_news, ticker)
+        age_days, pct_change = _compute_catalyst_freshness(ticker, rec.news_headlines, rec.current_price)
+        rec.catalyst_age_days = age_days if age_days is not None else -1
+        rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
+        rec.fundamentals = await loop.run_in_executor(None, _fetch_fundamentals, ticker)
 
         return {
-            "symbol": symbol,
+            "symbol": ticker,
             "analysis_timestamp": datetime.utcnow().isoformat(),
-            "price": price,
-            "recommendation": ml_prediction.get('recommendation'),
-            "confidence": ml_prediction.get('confidence'),
-            "strategy": strategy_rec.get('best_strategy'),
-            "thesis": reasoning.get('main_thesis'),
-            "supporting_analysis": reasoning.get('supporting_analysis'),
-            "risk_reward": reasoning.get('risk_reward_analysis'),
-            "key_catalysts": reasoning.get('key_catalysts'),
-            "key_levels": reasoning.get('key_levels'),
-            "market_regime": market_analysis.get('trend', {}).get('direction'),
-            "options_recommendation": {
-                "action": action,
-                "strike_price": strike,
-                "expiry_date": expiry,
-                "score": ml_prediction.get('confidence', 0.5),
-            }
+            "recommendation": asdict(rec),
+            "key_factors": result.key_factors,
+            "risks": result.risks,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error analyzing {symbol}: {str(e)}")
+        logger.error(f"Error analyzing {ticker}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
