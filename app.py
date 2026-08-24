@@ -180,6 +180,8 @@ class OptionsRecommendation:
     long_term_score: float = 0.0  # weeks-to-months stock ranking — see _compute_long_term_score
     news_headlines: list = None  # display-only, not used in scoring
     fundamentals: dict = None    # balance sheet, cash flow, income — top 20 only
+    catalyst_age_days: int = -1        # days since the most recent headline; -1 = no news found
+    price_change_since_catalyst: float = 0.0  # % move since that headline — see _compute_catalyst_freshness
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -524,6 +526,59 @@ def _fetch_ticker_news(ticker: str) -> list:
         return result
     except Exception:
         return []
+
+
+_SCAN_HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history")
+
+
+def _find_price_near_date(ticker: str, target_date) -> Optional[float]:
+    """Look up ticker's scanned price on/soon after target_date from the local
+    scan_history archive — used to measure how much of a move already
+    happened before today's signal, not just whether the headline is old."""
+    try:
+        import json as _json
+        for offset in range(3):  # target day, then up to 2 days later (weekends/holidays)
+            day_dir = os.path.join(_SCAN_HISTORY_DIR, (target_date + timedelta(days=offset)).strftime("%Y-%m-%d"))
+            if not os.path.isdir(day_dir):
+                continue
+            for fname in sorted(os.listdir(day_dir)):
+                path = os.path.join(day_dir, fname)
+                try:
+                    with open(path) as f:
+                        data = _json.load(f)
+                except Exception:
+                    continue
+                for r in data.get("recommendations", []):
+                    if r.get("ticker") == ticker and r.get("current_price"):
+                        return float(r["current_price"])
+        return None
+    except Exception:
+        return None
+
+
+def _compute_catalyst_freshness(ticker: str, headlines: list, current_price: float):
+    """How old is the news driving this signal, and how much of the move
+    already happened? Catches cases like TEM's Merck/Moderna pop on
+    2026-08-19 — by the following Monday the most recent headline is days
+    old with no fresh follow-up, and most of the price move already
+    happened, so a fresh BUY signal that day would be chasing a move that's
+    largely over, not catching a new one. Returns (age_days, pct_change),
+    either of which is None if there isn't enough data to compute it."""
+    if not headlines:
+        return None, None
+    try:
+        newest_ts = max((h.get("published_at") or 0) for h in headlines)
+        if not newest_ts:
+            return None, None
+        newest_dt = datetime.utcfromtimestamp(newest_ts)
+        age_days = (datetime.utcnow() - newest_dt).days
+        hist_price = _find_price_near_date(ticker, newest_dt.date())
+        pct_change = None
+        if hist_price and hist_price > 0 and current_price > 0:
+            pct_change = round((current_price - hist_price) / hist_price * 100, 1)
+        return age_days, pct_change
+    except Exception:
+        return None, None
 
 
 def _fetch_fundamentals(ticker: str) -> dict:
@@ -881,6 +936,9 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     for rec in top_recs[:20]:
         rec.news_headlines = _fetch_ticker_news(rec.ticker)
         rec.fundamentals   = _fetch_fundamentals(rec.ticker)
+        age_days, pct_change = _compute_catalyst_freshness(rec.ticker, rec.news_headlines, rec.current_price)
+        rec.catalyst_age_days = age_days if age_days is not None else -1
+        rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
 
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
@@ -1271,6 +1329,8 @@ async def push_sp500_results(
                 long_term_score=r.get("long_term_score", 0.0),
                 fundamentals=r.get("fundamentals", {}),
                 news_headlines=r.get("news_headlines", []),
+                catalyst_age_days=r.get("catalyst_age_days", -1),
+                price_change_since_catalyst=r.get("price_change_since_catalyst", 0.0),
             ))
         except Exception as e:
             logger.warning(f"Skipping bad rec: {e}")
