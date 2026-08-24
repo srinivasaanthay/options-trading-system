@@ -727,6 +727,35 @@ _last_snapshot_date: Optional[str]  = None  # ET date of last saved snapshot (cl
 
 GAP_RISK_PCT = 0.07  # already-moved-this-much-since-last-close is treated as "something happened"
 
+_data_feed_cache = None  # None = not yet checked; DataFeed.SIP or DataFeed.IEX once known
+
+
+def _get_data_feed():
+    """Detect once whether the Alpaca account has real-time SIP entitlement
+    and cache the result — avoids retrying a failing SIP check on every
+    single request. Measured 2026-08-24: the free IEX feed (single venue,
+    not the consolidated tape) runs ~10-27 minutes behind wall-clock time
+    depending on the ticker, which every price-based score has been quietly
+    running on. Once the account is upgraded to the paid SIP plan, this
+    starts returning DataFeed.SIP automatically on the next process
+    restart — no further code change needed."""
+    global _data_feed_cache
+    if _data_feed_cache is not None:
+        return _data_feed_cache
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        from alpaca.data.enums import DataFeed
+        client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
+        client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols="SPY", feed=DataFeed.SIP))
+        _data_feed_cache = DataFeed.SIP
+        logger.info("[DataFeed] Real-time SIP feed available — using it")
+    except Exception:
+        from alpaca.data.enums import DataFeed
+        _data_feed_cache = DataFeed.IEX
+        logger.info("[DataFeed] SIP not available on this account — using free IEX feed (delayed)")
+    return _data_feed_cache
+
 
 def _fetch_prev_closes_batch(tickers: List[str]) -> Dict[str, float]:
     """Previous session's close per ticker, via the same Alpaca snapshot data
@@ -744,7 +773,7 @@ def _fetch_prev_closes_batch(tickers: List[str]) -> Dict[str, float]:
         chunk_size = 500
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i + chunk_size]
-            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk, feed=_get_data_feed()))
             for sym, snap in snaps.items():
                 if snap.previous_daily_bar and snap.previous_daily_bar.close:
                     prev_closes[sym] = float(snap.previous_daily_bar.close)
@@ -770,7 +799,7 @@ def _fetch_intraday_extremes_batch(tickers: List[str]) -> Dict[str, Tuple[float,
         chunk_size = 500
         for i in range(0, len(tickers), chunk_size):
             chunk = tickers[i:i + chunk_size]
-            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+            snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk, feed=_get_data_feed()))
             for sym, snap in snaps.items():
                 bar = snap.daily_bar
                 if bar and bar.high and bar.low:
@@ -793,7 +822,7 @@ def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
             chunk_size = 500
             for i in range(0, len(tickers), chunk_size):
                 chunk = tickers[i:i + chunk_size]
-                snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk))
+                snaps = client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=chunk, feed=_get_data_feed()))
                 for sym, snap in snaps.items():
                     p = 0.0
                     if snap.latest_quote:
@@ -836,7 +865,7 @@ def _fallback_price(ticker: str) -> float:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockLatestQuoteRequest
             client = StockHistoricalDataClient(_ALPACA_KEY, _ALPACA_SECRET)
-            quotes = client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=ticker))
+            quotes = client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=ticker, feed=_get_data_feed()))
             q = quotes.get(ticker)
             if q:
                 ask = float(q.ask_price or 0)
