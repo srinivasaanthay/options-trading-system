@@ -402,48 +402,157 @@ def _compute_long_term_score(tech: float, rs_score: float, fund: float, analyst_
 
 def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
                       tech: float, rs: float, iv_rank: float, vol_ratio: float,
-                      intraday_move_pct: float) -> str:
-    """Build the thesis sentence from the SAME real signals that drive `score`
-    above — previously this came from mcp_stock_agent's own separate
-    strategy_selector/reasoning_generator path, which leans on the broad
+                      intraday_move_pct: float, price: float, strike: float,
+                      days_to_earnings: int) -> str:
+    """Build a plain-language, multi-paragraph explanation from the SAME real
+    signals that drive `score` above — not just a stat summary, but something
+    a non-expert can actually read and act on: what's happening, why, what
+    to watch for, and a forward-looking "if this / then that" scenario.
+    Previously this came from mcp_stock_agent's own separate
+    strategy_selector/reasoning_generator path, which leaned on the broad
     market regime rather than this ticker's actual numbers and could (and
-    did) produce bullish-sounding text attached to an AVOID/PUT verdict."""
+    did) produce bullish-sounding text attached to an AVOID/PUT verdict —
+    every sentence here traces back to a number already on screen."""
     bullish = action == "CALL"
-    direction = "bullish" if bullish else "bearish"
     strength = {
-        "VERY_HIGH": "high-conviction", "HIGH": "solid", "MODERATE": "moderate",
-        "LOW": "weak", "VERY_LOW": "very weak",
-    }.get(confidence, "mixed")
-    parts = [f"{ticker} shows a {strength} {direction} setup ({score:.0%})."]
+        "VERY_HIGH": "a high-conviction", "HIGH": "a solid", "MODERATE": "a moderate",
+        "LOW": "a weak", "VERY_LOW": "a very weak",
+    }.get(confidence, "a mixed")
+    paragraphs: List[str] = []
 
-    if bullish and tech >= 0.55:
-        parts.append("Technicals are constructive, above key levels.")
-    elif bullish:
-        parts.append("Technicals are the weak link despite the overall lean.")
-    elif not bullish and tech <= 0.45:
-        parts.append("Technicals are deteriorating, below key levels.")
+    # ── Opening: what's happening, in plain terms ──────────────────────────
+    if bullish:
+        if tech >= 0.55 and rs >= 1.0:
+            opener = (f"{ticker} has been trending higher and is showing more strength than the "
+                      f"broader market right now — that combination is what's driving {strength} "
+                      f"bullish read ({score:.0%}).")
+        elif tech >= 0.55:
+            opener = (f"{ticker} has been trending higher recently, which is the main thing behind "
+                      f"{strength} bullish read ({score:.0%}).")
+        else:
+            opener = (f"The overall read on {ticker} leans bullish ({score:.0%}), but that's {strength} "
+                      f"call — the recent price action itself hasn't been especially strong, so this "
+                      f"rests more on the other factors below than on clear momentum.")
     else:
-        parts.append("Technicals aren't confirming the bearish case yet.")
+        if tech <= 0.45 and rs <= -1.0:
+            opener = (f"{ticker} has been trending lower and underperforming the broader market — "
+                      f"that combination is what's driving {strength} bearish read ({score:.0%}).")
+        elif tech <= 0.45:
+            opener = (f"{ticker} has been trending lower recently, which is the main thing behind "
+                      f"{strength} bearish read ({score:.0%}).")
+        else:
+            opener = (f"The overall read on {ticker} leans bearish ({score:.0%}), but that's {strength} "
+                      f"call — the price action itself hasn't clearly broken down yet, so this is more "
+                      f"about warning signs below than an obvious downtrend.")
+    paragraphs.append(opener)
 
-    if rs >= 1.0:
-        parts.append(f"Outperforming SPY by {rs:.1f}%.")
-    elif rs <= -1.0:
-        parts.append(f"Underperforming SPY by {abs(rs):.1f}%.")
-
-    if iv_rank <= 30:
-        parts.append(f"Options are relatively cheap (IV rank {iv_rank:.0f}).")
-    elif iv_rank >= 70:
-        parts.append(f"Options are expensive right now (IV rank {iv_rank:.0f}).")
-
+    # ── Supporting detail: RS, volume, IV — in plain language ──────────────
+    detail: List[str] = []
+    if abs(rs) >= 1.0:
+        rel = "outperforming" if rs > 0 else "underperforming"
+        detail.append(
+            f"Over the recent trading days it's been {rel} the S&P 500 by about {abs(rs):.1f}% — "
+            f"stocks that move independently of the broader market are usually reacting to something "
+            f"specific to the company, not just riding the overall market up or down."
+        )
     if vol_ratio >= 1.5:
-        parts.append(f"Volume running {vol_ratio:.1f}x average.")
+        detail.append(
+            f"Trading volume has also picked up, running about {vol_ratio:.1f}x the normal daily "
+            f"average — that usually means real money is behind this move, not just noise."
+        )
+    elif vol_ratio <= 0.6:
+        detail.append(
+            f"One thing to watch: volume has actually been below average ({vol_ratio:.1f}x normal), "
+            f"so this move hasn't attracted much real conviction yet — it could fade as easily as it started."
+        )
+    if iv_rank <= 30:
+        detail.append(
+            f"Options themselves are relatively cheap right now (IV rank {iv_rank:.0f}/100), which "
+            f"works in your favor — you're not paying a big premium for the market's fear or excitement."
+        )
+    elif iv_rank >= 70:
+        detail.append(
+            f"Options are expensive right now (IV rank {iv_rank:.0f}/100) — you're paying up for this "
+            f"trade, which means {ticker} needs to move further just to break even, let alone profit."
+        )
+    if detail:
+        paragraphs.append(" ".join(detail))
 
-    if intraday_move_pct <= -1.5 and bullish:
-        parts.append(f"Already faded {abs(intraday_move_pct):.1f}% off today's high.")
-    elif intraday_move_pct >= 1.5 and not bullish:
-        parts.append(f"Already bounced {intraday_move_pct:.1f}% off today's low.")
+    # ── Near-term wrinkle: same-day reversal ────────────────────────────────
+    if bullish and intraday_move_pct <= -1.5:
+        paragraphs.append(
+            f"There's a near-term wrinkle, though: {ticker} has already pulled back "
+            f"{abs(intraday_move_pct):.1f}% from its high today. Buying right now means buying after "
+            f"the strongest part of today's move already happened, not before it."
+        )
+    elif not bullish and intraday_move_pct >= 1.5:
+        paragraphs.append(
+            f"There's a near-term wrinkle, though: {ticker} has already bounced "
+            f"{intraday_move_pct:.1f}% off its low today. Betting on further downside right now means "
+            f"betting that bounce fails, not that the drop is still fresh."
+        )
 
-    return " ".join(parts)
+    # ── Earnings risk ────────────────────────────────────────────────────────
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 10:
+        paragraphs.append(
+            f"Also worth knowing: {ticker} reports earnings in {days_to_earnings} day(s). That's a "
+            f"real wildcard — a single earnings report can move a stock more in one day than weeks of "
+            f"normal trading, in either direction, regardless of everything above."
+        )
+
+    # ── Forward-looking scenario — the "if this happens, then that" ask ────
+    dist_pct = abs(strike - price) / price * 100 if price > 0 else 0.0
+    if bullish:
+        paragraphs.append(
+            f"Realistically: if {ticker} keeps climbing the way it has — especially on continued "
+            f"volume — a push toward the ${strike:.0f} level (about {dist_pct:.1f}% above the current "
+            f"${price:.2f}) is plausible. But if it stalls or turns lower, especially if it slips back "
+            f"below where it opened today, that's usually the sign this setup is losing steam — at that "
+            f"point stepping aside beats hoping it recovers. None of this is a guarantee either way; "
+            f"it's what the current numbers suggest, not a prediction."
+        )
+    else:
+        paragraphs.append(
+            f"Realistically: if {ticker} keeps sliding the way it has — especially on continued "
+            f"volume — a move down toward the ${strike:.0f} level (about {dist_pct:.1f}% below the "
+            f"current ${price:.2f}) is plausible. But if it stabilizes or bounces back above where it "
+            f"opened today, that's usually the sign this breakdown isn't following through — at that "
+            f"point stepping aside beats assuming it keeps falling. None of this is a guarantee either "
+            f"way; it's what the current numbers suggest, not a prediction."
+        )
+
+    return "\n\n".join(paragraphs)
+
+
+def _append_catalyst_narrative(thesis: str, ticker: str, catalyst_age_days: int,
+                                price_change_since_catalyst: float) -> str:
+    """Append a plain-language paragraph about news timing to an already-built
+    thesis. Separate from _generate_thesis because catalyst_age_days/
+    price_change_since_catalyst require an expensive news+historical-price
+    lookup (_compute_catalyst_freshness) only run for the top-ranked
+    candidates, not the full scanned pool — see call sites."""
+    if catalyst_age_days is None or catalyst_age_days < 0:
+        return thesis
+    if catalyst_age_days == 0:
+        addition = (
+            f"There's also fresh news out on {ticker} today driving some of this — the market is "
+            f"still digesting it, so the next day or two is usually when most of any further reaction happens."
+        )
+    elif catalyst_age_days == 1:
+        addition = (
+            f"The news behind this surfaced yesterday, so there may still be a little more room for "
+            f"the market to react, but the bulk of the initial move has likely already happened."
+        )
+    elif catalyst_age_days >= 5:
+        addition = (
+            f"Worth flagging: the news driving this is already {catalyst_age_days} days old, and "
+            f"{ticker} has moved {price_change_since_catalyst:+.1f}% since then — a lot of that story "
+            f"may already be priced in. A trade here is more a bet the move continues than a bet on "
+            f"genuinely new information."
+        )
+    else:
+        return thesis
+    return thesis + "\n\n" + addition
 
 
 def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[str], List[str]]:
@@ -600,7 +709,9 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         sentiment_score=round(analysis_result.sentiment_score, 4),
         ml_score=round(analysis_result.ml_score, 4),
         timestamp=datetime.utcnow().isoformat(),
-        thesis=_generate_thesis(ticker, action, score, confidence, tech, rs, iv_rank, vol_ratio, intraday_move_pct),
+        thesis=_generate_thesis(ticker, action, score, confidence, tech, rs, iv_rank, vol_ratio,
+                                 intraday_move_pct, price, strike,
+                                 getattr(analysis_result, 'days_to_earnings', 999)),
         days_to_expiry=days_to_expiry,
         iv_rank=round(getattr(analysis_result, 'iv_rank', 50.0), 1),
         volume_ratio=round(getattr(analysis_result, 'volume_ratio', 1.0), 2),
@@ -1250,6 +1361,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
         age_days, pct_change = _compute_catalyst_freshness(rec.ticker, rec.news_headlines, rec.current_price)
         rec.catalyst_age_days = age_days if age_days is not None else -1
         rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
+        rec.thesis = _append_catalyst_narrative(rec.thesis, rec.ticker, rec.catalyst_age_days, rec.price_change_since_catalyst)
 
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
@@ -1769,6 +1881,7 @@ async def analyze_stock(
         age_days, pct_change = _compute_catalyst_freshness(ticker, rec.news_headlines, rec.current_price)
         rec.catalyst_age_days = age_days if age_days is not None else -1
         rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
+        rec.thesis = _append_catalyst_narrative(rec.thesis, rec.ticker, rec.catalyst_age_days, rec.price_change_since_catalyst)
         rec.fundamentals = await loop.run_in_executor(None, _fetch_fundamentals, ticker)
         key_factors, risks = _generate_key_factors_and_risks(rec)
 
