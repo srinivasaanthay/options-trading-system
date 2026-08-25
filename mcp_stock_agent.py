@@ -1010,11 +1010,13 @@ class MCPStockAgent:
 
     def _fetch_real_options_data(self, ticker: str, price: float) -> Dict:
         """Fetch real options chain: IV per strike, put/call ratio, ATM recommendations."""
-        # 20-min cache matches the analysis cycle
+        # 5-min cache — IV rank is a real 20%-weighted scoring input and can
+        # move meaningfully faster than the old 20-min window, especially
+        # right after news breaks or on a volatile session.
         now = datetime.utcnow()
         if ticker in self._options_cache:
             cached, fetched_at = self._options_cache[ticker]
-            if (now - fetched_at).total_seconds() < 1200:
+            if (now - fetched_at).total_seconds() < 300:
                 return cached
 
         try:
