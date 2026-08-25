@@ -400,6 +400,120 @@ def _compute_long_term_score(tech: float, rs_score: float, fund: float, analyst_
     return round(min(1.0, max(0.0, raw)), 4)
 
 
+def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
+                      tech: float, rs: float, iv_rank: float, vol_ratio: float,
+                      intraday_move_pct: float) -> str:
+    """Build the thesis sentence from the SAME real signals that drive `score`
+    above — previously this came from mcp_stock_agent's own separate
+    strategy_selector/reasoning_generator path, which leans on the broad
+    market regime rather than this ticker's actual numbers and could (and
+    did) produce bullish-sounding text attached to an AVOID/PUT verdict."""
+    bullish = action == "CALL"
+    direction = "bullish" if bullish else "bearish"
+    strength = {
+        "VERY_HIGH": "high-conviction", "HIGH": "solid", "MODERATE": "moderate",
+        "LOW": "weak", "VERY_LOW": "very weak",
+    }.get(confidence, "mixed")
+    parts = [f"{ticker} shows a {strength} {direction} setup ({score:.0%})."]
+
+    if bullish and tech >= 0.55:
+        parts.append("Technicals are constructive, above key levels.")
+    elif bullish:
+        parts.append("Technicals are the weak link despite the overall lean.")
+    elif not bullish and tech <= 0.45:
+        parts.append("Technicals are deteriorating, below key levels.")
+    else:
+        parts.append("Technicals aren't confirming the bearish case yet.")
+
+    if rs >= 1.0:
+        parts.append(f"Outperforming SPY by {rs:.1f}%.")
+    elif rs <= -1.0:
+        parts.append(f"Underperforming SPY by {abs(rs):.1f}%.")
+
+    if iv_rank <= 30:
+        parts.append(f"Options are relatively cheap (IV rank {iv_rank:.0f}).")
+    elif iv_rank >= 70:
+        parts.append(f"Options are expensive right now (IV rank {iv_rank:.0f}).")
+
+    if vol_ratio >= 1.5:
+        parts.append(f"Volume running {vol_ratio:.1f}x average.")
+
+    if intraday_move_pct <= -1.5 and bullish:
+        parts.append(f"Already faded {abs(intraday_move_pct):.1f}% off today's high.")
+    elif intraday_move_pct >= 1.5 and not bullish:
+        parts.append(f"Already bounced {intraday_move_pct:.1f}% off today's low.")
+
+    return " ".join(parts)
+
+
+def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[str], List[str]]:
+    """Key factors / risks for the single-ticker analyze endpoint, built from
+    the same real signals that already drove `rec.score` — replaces the old
+    mcp_stock_agent narrative (strategy_selector/reasoning_generator), which
+    was decoupled from this score and could contradict the actual verdict."""
+    bullish = rec.action == "CALL"
+    factors: List[str] = []
+    risks: List[str] = []
+
+    if bullish:
+        if rec.technical_score >= 0.55:
+            factors.append(f"Technical score of {rec.technical_score:.0%} supports the bullish case.")
+        else:
+            risks.append(f"Technical score is only {rec.technical_score:.0%} — not strongly confirming.")
+        if rec.rs_vs_spy >= 1.0:
+            factors.append(f"Outperforming SPY by {rec.rs_vs_spy:.1f}% over the lookback window.")
+        elif rec.rs_vs_spy <= -1.0:
+            risks.append(f"Underperforming SPY by {abs(rec.rs_vs_spy):.1f}% despite the bullish lean.")
+    else:
+        if rec.technical_score <= 0.45:
+            factors.append(f"Technical score of {rec.technical_score:.0%} confirms the bearish case.")
+        else:
+            risks.append(f"Technical score is {rec.technical_score:.0%} — not deeply bearish yet.")
+        if rec.rs_vs_spy <= -1.0:
+            factors.append(f"Underperforming SPY by {abs(rec.rs_vs_spy):.1f}%.")
+        elif rec.rs_vs_spy >= 1.0:
+            risks.append(f"Outperforming SPY by {rec.rs_vs_spy:.1f}% despite the bearish lean.")
+
+    if rec.iv_rank <= 30:
+        factors.append(f"IV rank {rec.iv_rank:.0f} — options are relatively cheap to buy.")
+    elif rec.iv_rank >= 70:
+        risks.append(f"IV rank {rec.iv_rank:.0f} — options are expensive, eating into edge.")
+
+    if rec.volume_ratio >= 1.5:
+        factors.append(f"Volume running {rec.volume_ratio:.1f}x average — real interest behind the move.")
+    elif rec.volume_ratio <= 0.5:
+        risks.append("Volume is thin — low conviction behind the move.")
+
+    if rec.analyst_upside >= 5:
+        factors.append(f"Analysts see {rec.analyst_upside:.1f}% upside to target price.")
+    elif rec.analyst_upside <= -5:
+        risks.append(f"Analysts see {rec.analyst_upside:.1f}% downside to target price.")
+
+    if bullish and rec.intraday_move_pct <= -1.5:
+        risks.append(f"Already faded {abs(rec.intraday_move_pct):.1f}% off today's high — chasing a move that may be reversing.")
+    elif not bullish and rec.intraday_move_pct >= 1.5:
+        risks.append(f"Already bounced {rec.intraday_move_pct:.1f}% off today's low — chasing a move that may be reversing.")
+
+    if rec.catalyst_age_days is not None and rec.catalyst_age_days >= 0:
+        if rec.catalyst_age_days <= 1:
+            factors.append("Catalyst is fresh — most recent headline is from today or yesterday.")
+        elif rec.catalyst_age_days >= 5:
+            risks.append(
+                f"Catalyst is {rec.catalyst_age_days} days old — the move may already be "
+                f"priced in ({rec.price_change_since_catalyst:+.1f}% since then)."
+            )
+
+    if 0 <= rec.days_to_earnings <= 5:
+        risks.append(f"Earnings in {rec.days_to_earnings} day(s) — expect elevated volatility.")
+
+    if not factors:
+        factors.append("No single factor stands out — this is a low-conviction, borderline signal.")
+    if not risks:
+        risks.append("No major red flags identified in the scanned signals.")
+
+    return factors, risks
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float,
                        today_high: float = None, today_low: float = None) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
@@ -486,7 +600,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         sentiment_score=round(analysis_result.sentiment_score, 4),
         ml_score=round(analysis_result.ml_score, 4),
         timestamp=datetime.utcnow().isoformat(),
-        thesis=analysis_result.thesis[:200] if analysis_result.thesis else "",
+        thesis=_generate_thesis(ticker, action, score, confidence, tech, rs, iv_rank, vol_ratio, intraday_move_pct),
         days_to_expiry=days_to_expiry,
         iv_rank=round(getattr(analysis_result, 'iv_rank', 50.0), 1),
         volume_ratio=round(getattr(analysis_result, 'volume_ratio', 1.0), 2),
@@ -1619,13 +1733,14 @@ async def analyze_stock(
         rec.catalyst_age_days = age_days if age_days is not None else -1
         rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
         rec.fundamentals = await loop.run_in_executor(None, _fetch_fundamentals, ticker)
+        key_factors, risks = _generate_key_factors_and_risks(rec)
 
         return {
             "symbol": ticker,
             "analysis_timestamp": datetime.utcnow().isoformat(),
             "recommendation": asdict(rec),
-            "key_factors": result.key_factors,
-            "risks": result.risks,
+            "key_factors": key_factors,
+            "risks": risks,
         }
 
     except HTTPException:
