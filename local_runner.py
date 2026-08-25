@@ -24,7 +24,10 @@ load_dotenv()
 
 RAILWAY_URL = os.getenv("RAILWAY_URL", "https://arka.up.railway.app")
 API_TOKEN   = os.getenv("API_SECRET_KEY", "arka-secret-2024")
-INTERVAL    = 5 * 60   # 5 minutes
+INTERVAL    = 2 * 60   # 2 minutes — a full scan now takes ~30s (parallelized),
+                       # so this still leaves comfortable headroom; tighter than
+                       # this and a WebSocket streaming feed would fit better
+                       # than periodic scanning
 
 SCAN_HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history")
 

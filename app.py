@@ -1169,7 +1169,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     return latest_options_recs
 
 
-SP500_SCAN_INTERVAL = 5 * 60  # matches local_runner.py's cadence
+SP500_SCAN_INTERVAL = 2 * 60  # matches local_runner.py's cadence
 
 
 async def _sp500_scheduler_loop():
