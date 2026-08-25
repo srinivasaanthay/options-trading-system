@@ -183,12 +183,18 @@ class OptionsRecommendation:
     catalyst_age_days: int = -1        # days since the most recent headline; -1 = no news found
     price_change_since_catalyst: float = 0.0  # % move since that headline — see _compute_catalyst_freshness
     intraday_move_pct: float = 0.0     # % faded off today's high (CALL) or bounced off today's low (PUT)
+    key_factors: list = None  # see _generate_key_factors_and_risks — same real signals that drive `score`
+    risks: list = None
 
     def __post_init__(self):
         if self.news_headlines is None:
             self.news_headlines = []
         if self.fundamentals is None:
             self.fundamentals = {}
+        if self.key_factors is None:
+            self.key_factors = []
+        if self.risks is None:
+            self.risks = []
 
 
 def _next_monthly_expiry(from_date: datetime = None) -> str:
@@ -818,7 +824,7 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
     days_to_expiry = (expiry_dt - datetime.utcnow()).days
 
-    return OptionsRecommendation(
+    rec = OptionsRecommendation(
         ticker=ticker,
         action=action,
         strike_price=strike,
@@ -845,6 +851,11 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         long_term_score=long_term_score,
         intraday_move_pct=intraday_move_pct,
     )
+    # Computed here so every scanned rec carries them (cheap, no network calls)
+    # — not just the ones enriched with catalyst data later. See call sites
+    # below that recompute after catalyst_age_days is set, for freshness.
+    rec.key_factors, rec.risks = _generate_key_factors_and_risks(rec)
+    return rec
 
 
 _POSITIVE_WORDS = {'surge','soar','rally','gain','growth','profit','strong','rebound','upgrade',
@@ -1486,6 +1497,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
         rec.catalyst_age_days = age_days if age_days is not None else -1
         rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
         rec.thesis = _append_catalyst_narrative(rec.thesis, rec.ticker, rec.catalyst_age_days, rec.price_change_since_catalyst)
+        rec.key_factors, rec.risks = _generate_key_factors_and_risks(rec)  # recompute — catalyst fields now set
 
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
@@ -2007,14 +2019,14 @@ async def analyze_stock(
         rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
         rec.thesis = _append_catalyst_narrative(rec.thesis, rec.ticker, rec.catalyst_age_days, rec.price_change_since_catalyst)
         rec.fundamentals = await loop.run_in_executor(None, _fetch_fundamentals, ticker)
-        key_factors, risks = _generate_key_factors_and_risks(rec)
+        rec.key_factors, rec.risks = _generate_key_factors_and_risks(rec)  # recompute — catalyst fields now set
 
         return {
             "symbol": ticker,
             "analysis_timestamp": datetime.utcnow().isoformat(),
             "recommendation": asdict(rec),
-            "key_factors": key_factors,
-            "risks": risks,
+            "key_factors": rec.key_factors,
+            "risks": rec.risks,
         }
 
     except HTTPException:
