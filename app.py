@@ -658,7 +658,103 @@ last_sp500_run: Optional[datetime] = None
 
 _RESULTS_FILE = "/tmp/sp500_results.json"
 
+# ── Postgres persistence ─────────────────────────────────────────────────
+# The in-memory cache and the /tmp JSON fallback below are both wiped by
+# every Railway redeploy — confirmed the hard way on 2026-08-24, when a
+# deploy after market close left the app with zero recommendations because
+# /tmp doesn't survive a redeploy and local_runner.py had already gone to
+# sleep for the night. Postgres actually survives redeploys. Used as the
+# primary store; the /tmp file stays as a secondary fallback in case
+# DATABASE_URL is ever unset, so nothing regresses if Postgres is briefly
+# unreachable.
+_pg_conn = None
+
+
+def _get_pg_conn():
+    global _pg_conn
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        return None
+    try:
+        if _pg_conn is not None and not _pg_conn.closed:
+            return _pg_conn
+        import psycopg2
+        _pg_conn = psycopg2.connect(db_url)
+        with _pg_conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS latest_scan (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    recommendations JSONB NOT NULL,
+                    last_run TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+        _pg_conn.commit()
+        return _pg_conn
+    except Exception as e:
+        logger.warning(f"[Postgres] Connection failed: {e}")
+        _pg_conn = None
+        return None
+
+
+def _save_results_pg():
+    conn = _get_pg_conn()
+    if conn is None:
+        return
+    try:
+        import json as _json
+        payload = _json.dumps([asdict(r) for r in latest_options_recs])
+        last_run_dt = last_sp500_run or datetime.utcnow()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO latest_scan (id, recommendations, last_run, updated_at)
+                VALUES (1, %s, %s, now())
+                ON CONFLICT (id) DO UPDATE
+                SET recommendations = EXCLUDED.recommendations,
+                    last_run = EXCLUDED.last_run,
+                    updated_at = now()
+            """, (payload, last_run_dt))
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[Postgres] Save failed: {e}")
+
+
+def _load_results_pg() -> bool:
+    """Returns True if it successfully restored from Postgres, so the /tmp
+    fallback below can be skipped when this already worked."""
+    global latest_options_recs, last_sp500_run
+    conn = _get_pg_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT recommendations, last_run FROM latest_scan WHERE id = 1")
+            row = cur.fetchone()
+        if not row:
+            return False
+        recs_data, last_run = row
+        saved_date = last_run.astimezone(ZoneInfo("America/New_York")).date()
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        if saved_date < today:
+            logger.info("[Postgres] Saved results are from a previous day — skipping load")
+            return False
+        recs = []
+        for r in recs_data:
+            try:
+                recs.append(OptionsRecommendation(**{k: r[k] for k in r if k in OptionsRecommendation.__dataclass_fields__}))
+            except Exception:
+                continue
+        latest_options_recs = recs
+        last_sp500_run = last_run.astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None)
+        logger.info(f"[Postgres] Restored {len(recs)} recommendations from database")
+        return True
+    except Exception as e:
+        logger.warning(f"[Postgres] Load failed: {e}")
+        return False
+
+
 def _save_results():
+    _save_results_pg()
     try:
         import json as _json
         data = {"last_run": last_sp500_run.isoformat() if last_sp500_run else None,
@@ -670,6 +766,8 @@ def _save_results():
 
 def _load_results():
     global latest_options_recs, last_sp500_run
+    if _load_results_pg():
+        return
     try:
         import json as _json
         with open(_RESULTS_FILE) as f:
