@@ -116,6 +116,9 @@ class AnalysisResult:
     fundamental_score: float = 0.5  # 0-1 from analyst targets + short interest
     analyst_upside: float = 0.0     # analyst consensus target vs current price (%)
     short_interest_pct: float = 0.0 # short interest as % of float
+    rsi: float = 50.0               # 14-day RSI — was computed for scoring and discarded;
+                                     # exposed so narrative text can say whether a move is
+                                     # fresh (room to continue) or already stretched (>70/<30)
 
 
 @dataclass
@@ -302,6 +305,7 @@ class MCPStockAgent:
                 fundamental_score=fundamental.get('fundamental_score', 0.5),
                 analyst_upside=fundamental.get('analyst_upside', 0.0),
                 short_interest_pct=fundamental.get('short_interest_pct', 0.0),
+                rsi=technical_data.get('rsi', 50.0),
             )
 
             # Store in history

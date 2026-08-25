@@ -403,7 +403,8 @@ def _compute_long_term_score(tech: float, rs_score: float, fund: float, analyst_
 def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
                       tech: float, rs: float, iv_rank: float, vol_ratio: float,
                       intraday_move_pct: float, price: float, strike: float,
-                      days_to_earnings: int) -> str:
+                      days_to_earnings: int, rsi: float = 50.0,
+                      market_score: float = 0.5) -> str:
     """Build a plain-language, multi-paragraph explanation from the SAME real
     signals that drive `score` above — not just a stat summary, but something
     a non-expert can actually read and act on: what's happening, why, what
@@ -478,6 +479,80 @@ def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
     if detail:
         paragraphs.append(" ".join(detail))
 
+    # ── Where this sits in its move — fresh vs already-stretched, using RSI.
+    # This is the piece that answers "is this the start of a run or has it
+    # already run" — RSI was already being computed for scoring and quietly
+    # discarded before this; it's the standard way to measure that without
+    # guessing, and it cuts both ways (stretched can still keep going,
+    # oversold can still keep falling), which the text says explicitly.
+    if bullish:
+        if rsi >= 70:
+            paragraphs.append(
+                f"Where this sits in its move matters too: {ticker}'s RSI is at {rsi:.0f}, which is "
+                f"technically \"overbought\" — it's already climbed enough to be considered stretched, "
+                f"not just getting started. That doesn't mean it has to stop here, but stretched moves "
+                f"are more prone to at least pausing or pulling back to cool off, on top of anything "
+                f"else going on. If it does keep running from here, it's an extension of an existing "
+                f"move rather than a fresh breakout."
+            )
+        elif rsi <= 40:
+            paragraphs.append(
+                f"Where this sits in its move: {ticker}'s RSI is at {rsi:.0f}, still on the low side, "
+                f"which means this bullish read is catching it early rather than chasing something "
+                f"that's already run hard — closer to the start of a potential move than the middle or "
+                f"end of one, if the thesis plays out. The flip side of \"hasn't moved much yet\" is "
+                f"that the case is less proven so far."
+            )
+        else:
+            paragraphs.append(
+                f"Where this sits in its move: {ticker}'s RSI is a middling {rsi:.0f} — not stretched, "
+                f"not fresh off the bottom either. There's room for this to continue without being "
+                f"flagged as overheated, but it's also not an obvious early-stage setup."
+            )
+    else:
+        if rsi <= 30:
+            paragraphs.append(
+                f"Where this sits in its move matters too: {ticker}'s RSI is at {rsi:.0f}, technically "
+                f"\"oversold\" — it's already fallen enough that a bounce becomes more likely on its "
+                f"own, purely on a mean-reversion basis. That's a real risk to this bearish case: "
+                f"oversold doesn't mean safe from further declines, but a lot of the drop may already "
+                f"be behind it rather than still ahead."
+            )
+        elif rsi >= 60:
+            paragraphs.append(
+                f"Where this sits in its move: {ticker}'s RSI is at {rsi:.0f}, still on the elevated "
+                f"side, meaning this bearish case is more about a pullback from an extended level than "
+                f"a stock that's already broken down — closer to the start of a potential reversal than "
+                f"something that's already fallen a long way."
+            )
+        else:
+            paragraphs.append(
+                f"Where this sits in its move: {ticker}'s RSI is a middling {rsi:.0f} — not stretched "
+                f"to the upside, not oversold either. There's room for this to keep sliding without "
+                f"being flagged as already-overdone, but it's also not a screaming oversold bounce risk."
+            )
+
+    # ── Broader market context — a risk this setup can't fully protect against ─
+    if market_score >= 0.65:
+        paragraphs.append(
+            f"Worth noting: the broader market itself is in a supportive stretch right now, which "
+            f"tends to lift most stocks together — that's a tailwind for this trade beyond {ticker}'s "
+            f"own numbers. If that changes and the overall market turns down, this setup would be "
+            f"fighting the tide instead of riding it."
+        )
+    elif market_score <= 0.4:
+        paragraphs.append(
+            f"One real risk sitting outside everything above: the broader market itself looks shaky "
+            f"right now. Even a stock with genuinely strong individual signals can get pulled down if "
+            f"the overall market turns lower — that's a risk {ticker}'s own numbers can't fully protect against."
+        )
+    else:
+        paragraphs.append(
+            f"The broader market itself is roughly neutral right now — not a strong tailwind, not a "
+            f"headwind either, so this trade is mostly standing on {ticker}'s own numbers rather than "
+            f"being carried or dragged by the overall market."
+        )
+
     # ── Near-term wrinkle: same-day reversal ────────────────────────────────
     if bullish and intraday_move_pct <= -1.5:
         paragraphs.append(
@@ -500,25 +575,72 @@ def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
             f"normal trading, in either direction, regardless of everything above."
         )
 
-    # ── Forward-looking scenario — the "if this happens, then that" ask ────
+    # ── Both directions, explicitly, each with real reasons ─────────────────
+    # Not just a primary call with a brief caveat — a genuine "it could go
+    # this way because X, or that way because Y," built from whichever of
+    # this ticker's own real signals actually support each side.
     dist_pct = abs(strike - price) / price * 100 if price > 0 else 0.0
     if bullish:
+        up_reasons = []
+        if rs >= 1.0:
+            up_reasons.append(f"it's already outperforming the market by {rs:.1f}%")
+        if vol_ratio >= 1.3:
+            up_reasons.append(f"volume ({vol_ratio:.1f}x average) is confirming real interest, not just drift")
+        if rsi < 65:
+            up_reasons.append("it isn't technically overbought yet, so there's room before this measure would call it stretched")
+        if not up_reasons:
+            up_reasons.append("the composite score leans this way even without one single dominant factor")
+
+        down_reasons = []
+        if rsi >= 65:
+            down_reasons.append(f"RSI at {rsi:.0f} means it's already stretched, which is exactly the kind of setup that tends to pause or pull back")
+        if intraday_move_pct <= -1.5:
+            down_reasons.append(f"it's already faded {abs(intraday_move_pct):.1f}% off today's high, showing some hesitation right now")
+        if vol_ratio < 0.8:
+            down_reasons.append("volume is on the light side, so the move so far hasn't attracted much real conviction")
+        if market_score <= 0.4:
+            down_reasons.append("the broader market itself is shaky, which drags on individual stocks regardless of their own setup")
+        if not down_reasons:
+            down_reasons.append("no single stock's setup is bulletproof — a broader market wobble or fresh negative news could turn this regardless of what's driving it today")
+
         paragraphs.append(
-            f"Realistically: if {ticker} keeps climbing the way it has — especially on continued "
-            f"volume — a push toward the ${strike:.0f} level (about {dist_pct:.1f}% above the current "
-            f"${price:.2f}) is plausible. But if it stalls or turns lower, especially if it slips back "
-            f"below where it opened today, that's usually the sign this setup is losing steam — at that "
-            f"point stepping aside beats hoping it recovers. None of this is a guarantee either way; "
-            f"it's what the current numbers suggest, not a prediction."
+            f"Put together: {ticker} could keep climbing toward the ${strike:.0f} level "
+            f"(about {dist_pct:.1f}% above the current ${price:.2f}) because " + ", and ".join(up_reasons) +
+            f". On the other hand, it could turn lower instead because " + ", and ".join(down_reasons) +
+            f" — in that case, slipping back below where it opened today would usually be the first real "
+            f"sign this setup is losing steam. Both are live possibilities; this isn't a forecast of "
+            f"which one happens, just what the current numbers support on each side."
         )
     else:
+        down_reasons = []
+        if rs <= -1.0:
+            down_reasons.append(f"it's already underperforming the market by {abs(rs):.1f}%")
+        if vol_ratio >= 1.3:
+            down_reasons.append(f"volume ({vol_ratio:.1f}x average) is confirming real selling, not just drift")
+        if rsi > 35:
+            down_reasons.append("it isn't technically oversold yet, so there's room before this measure would call the drop overdone")
+        if not down_reasons:
+            down_reasons.append("the composite score leans this way even without one single dominant factor")
+
+        up_reasons = []
+        if rsi <= 35:
+            up_reasons.append(f"RSI at {rsi:.0f} means it's already oversold, which is exactly the kind of setup that tends to bounce")
+        if intraday_move_pct >= 1.5:
+            up_reasons.append(f"it's already bounced {intraday_move_pct:.1f}% off today's low, showing some support right now")
+        if vol_ratio < 0.8:
+            up_reasons.append("volume is on the light side, so the drop so far hasn't attracted much real conviction")
+        if market_score >= 0.65:
+            up_reasons.append("the broader market itself is supportive right now, which tends to lift individual stocks regardless of their own setup")
+        if not up_reasons:
+            up_reasons.append("no breakdown is guaranteed to continue — a broader market rally or fresh positive news could reverse this regardless of what's driving it today")
+
         paragraphs.append(
-            f"Realistically: if {ticker} keeps sliding the way it has — especially on continued "
-            f"volume — a move down toward the ${strike:.0f} level (about {dist_pct:.1f}% below the "
-            f"current ${price:.2f}) is plausible. But if it stabilizes or bounces back above where it "
-            f"opened today, that's usually the sign this breakdown isn't following through — at that "
-            f"point stepping aside beats assuming it keeps falling. None of this is a guarantee either "
-            f"way; it's what the current numbers suggest, not a prediction."
+            f"Put together: {ticker} could keep sliding toward the ${strike:.0f} level "
+            f"(about {dist_pct:.1f}% below the current ${price:.2f}) because " + ", and ".join(down_reasons) +
+            f". On the other hand, it could stabilize or bounce instead because " + ", and ".join(up_reasons) +
+            f" — in that case, climbing back above where it opened today would usually be the first real "
+            f"sign this breakdown isn't following through. Both are live possibilities; this isn't a "
+            f"forecast of which one happens, just what the current numbers support on each side."
         )
 
     return "\n\n".join(paragraphs)
@@ -711,7 +833,9 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         timestamp=datetime.utcnow().isoformat(),
         thesis=_generate_thesis(ticker, action, score, confidence, tech, rs, iv_rank, vol_ratio,
                                  intraday_move_pct, price, strike,
-                                 getattr(analysis_result, 'days_to_earnings', 999)),
+                                 getattr(analysis_result, 'days_to_earnings', 999),
+                                 getattr(analysis_result, 'rsi', 50.0),
+                                 getattr(analysis_result, 'market_score', 0.5)),
         days_to_expiry=days_to_expiry,
         iv_rank=round(getattr(analysis_result, 'iv_rank', 50.0), 1),
         volume_ratio=round(getattr(analysis_result, 'volume_ratio', 1.0), 2),
