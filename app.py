@@ -1691,6 +1691,25 @@ async def trigger_sp500_analysis(
     }
 
 
+@app.post("/api/v1/sp500/refresh-now")
+async def refresh_sp500_now(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Manually run the REAL full scan (same _analyze_sp500_options the
+    scheduler calls) and persist it — unlike trigger-analysis above, which
+    only samples 20 tickers and doesn't update the live cache. For
+    refreshing stale/bad data on demand outside the scheduler's market-hours
+    window. Safe after-hours: trade execution inside _analyze_sp500_options
+    already checks _is_market_open() itself before placing anything."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not stock_agent:
+        raise HTTPException(status_code=503, detail="Agent not initialized")
+
+    recs = await _analyze_sp500_options()
+    return {"status": "refreshed", "recommendations_available": len(recs)}
+
+
 # ============================================================================
 # PHASE 3A: ANALYSIS ENDPOINTS
 # ============================================================================
