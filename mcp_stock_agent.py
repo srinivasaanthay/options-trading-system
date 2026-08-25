@@ -179,6 +179,7 @@ class MCPStockAgent:
 
         # Real-data caches
         self._ohlcv_cache: Dict[str, pd.DataFrame] = {}
+        self._alpaca_feed_cache = None  # cached SIP/IEX choice, see _get_alpaca_feed
         self._market_cache: Dict = {}
         self._market_cache_time: Optional[datetime] = None
         self._options_cache: Dict[str, Tuple[Dict, datetime]] = {}
@@ -563,57 +564,152 @@ class MCPStockAgent:
         return risks or ["Market conditions normal"]
 
     # -----------------------------------------------------------------------
-    # Real data methods (yfinance-backed)
+    # Real data methods (Alpaca-backed, yfinance fallback)
     # -----------------------------------------------------------------------
 
-    def prefetch_ohlcv(self, tickers: List[str]) -> None:
-        """Batch-download 1-year daily OHLCV for all tickers and fill cache."""
+    def _get_alpaca_feed(self):
+        """Cache SIP vs IEX choice for this process — same auto-detect
+        pattern app.py's _get_data_feed() uses; duplicated here rather than
+        imported to avoid a circular import (app.py imports this module)."""
+        if self._alpaca_feed_cache is not None:
+            return self._alpaca_feed_cache
+        from alpaca.data.enums import DataFeed
         try:
-            import yfinance as yf
-            chunk_size = 100
-            total_cached = 0
-            for i in range(0, len(tickers), chunk_size):
-                chunk = tickers[i:i + chunk_size]
-                try:
-                    raw = yf.download(
-                        chunk, period='1y', interval='1d',
-                        progress=False, auto_adjust=True
-                    )
-                    if raw.empty:
-                        continue
-                    for ticker in chunk:
-                        try:
-                            if isinstance(raw.columns, pd.MultiIndex):
-                                close = raw['Close'][ticker]
-                                high = raw['High'][ticker]
-                                low = raw['Low'][ticker]
-                                open_ = raw['Open'][ticker]
-                                vol = raw['Volume'][ticker]
-                            else:
-                                close = raw['Close']
-                                high = raw['High']
-                                low = raw['Low']
-                                open_ = raw['Open']
-                                vol = raw['Volume']
-                            df = pd.DataFrame({
-                                'close': close, 'high': high,
-                                'low': low, 'open': open_, 'volume': vol
-                            }).dropna(subset=['close'])
-                            if len(df) >= 20:
-                                self._ohlcv_cache[ticker] = df
-                                total_cached += 1
-                        except Exception:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestTradeRequest
+            key = os.environ.get('ALPACA_API_KEY', '')
+            secret = os.environ.get('ALPACA_API_SECRET', '')
+            client = StockHistoricalDataClient(key, secret)
+            client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols="SPY", feed=DataFeed.SIP))
+            self._alpaca_feed_cache = DataFeed.SIP
+        except Exception:
+            self._alpaca_feed_cache = DataFeed.IEX
+        return self._alpaca_feed_cache
+
+    def prefetch_ohlcv(self, tickers: List[str]) -> None:
+        """Batch-fetch ~1-year daily OHLCV for all tickers and fill cache.
+        Alpaca primary (same credentials/feed used everywhere else in this
+        system) — this was the highest-traffic yfinance dependency in the
+        whole pipeline (every ticker, every scan) and is what
+        technical_score/RS-vs-SPY are actually computed from, so it's worth
+        being on the more reliable source. yfinance kept only as a fallback
+        for tickers Alpaca's batch call doesn't return."""
+        cached_via_alpaca = set()
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            key = os.environ.get('ALPACA_API_KEY', '')
+            secret = os.environ.get('ALPACA_API_SECRET', '')
+            if key and secret:
+                client = StockHistoricalDataClient(key, secret)
+                chunk_size = 200
+                for i in range(0, len(tickers), chunk_size):
+                    chunk = tickers[i:i + chunk_size]
+                    try:
+                        req = StockBarsRequest(
+                            symbol_or_symbols=chunk,
+                            timeframe=TimeFrame.Day,
+                            start=datetime.utcnow() - timedelta(days=400),
+                            end=datetime.utcnow(),
+                            feed=self._get_alpaca_feed(),
+                            adjustment='all',
+                        )
+                        raw = client.get_stock_bars(req).df
+                        if raw.empty:
                             continue
-                except Exception as e:
-                    logger.warning(f"[OHLCV] chunk {i} failed: {e}")
-            logger.info(f"[OHLCV] Prefetched {total_cached}/{len(tickers)} tickers")
+                        symbols_present = set(raw.index.get_level_values(0))
+                        for ticker in chunk:
+                            if ticker not in symbols_present:
+                                continue
+                            try:
+                                tdf = raw.loc[ticker]
+                                df = tdf[['close', 'high', 'low', 'open', 'volume']].dropna(subset=['close'])
+                                if len(df) >= 20:
+                                    self._ohlcv_cache[ticker] = df
+                                    cached_via_alpaca.add(ticker)
+                            except Exception:
+                                continue
+                    except Exception as e:
+                        logger.warning(f"[OHLCV] Alpaca chunk {i} failed: {e}")
+                logger.info(f"[OHLCV] Alpaca prefetched {len(cached_via_alpaca)}/{len(tickers)} tickers")
         except Exception as e:
-            logger.error(f"[OHLCV] prefetch_ohlcv failed: {e}")
+            logger.warning(f"[OHLCV] Alpaca prefetch failed entirely: {e}")
+
+        missing = [t for t in tickers if t not in cached_via_alpaca]
+        if missing:
+            try:
+                import yfinance as yf
+                chunk_size = 100
+                total_cached = 0
+                for i in range(0, len(missing), chunk_size):
+                    chunk = missing[i:i + chunk_size]
+                    try:
+                        raw = yf.download(
+                            chunk, period='1y', interval='1d',
+                            progress=False, auto_adjust=True
+                        )
+                        if raw.empty:
+                            continue
+                        for ticker in chunk:
+                            try:
+                                if isinstance(raw.columns, pd.MultiIndex):
+                                    close = raw['Close'][ticker]
+                                    high = raw['High'][ticker]
+                                    low = raw['Low'][ticker]
+                                    open_ = raw['Open'][ticker]
+                                    vol = raw['Volume'][ticker]
+                                else:
+                                    close = raw['Close']
+                                    high = raw['High']
+                                    low = raw['Low']
+                                    open_ = raw['Open']
+                                    vol = raw['Volume']
+                                df = pd.DataFrame({
+                                    'close': close, 'high': high,
+                                    'low': low, 'open': open_, 'volume': vol
+                                }).dropna(subset=['close'])
+                                if len(df) >= 20:
+                                    self._ohlcv_cache[ticker] = df
+                                    total_cached += 1
+                            except Exception:
+                                continue
+                    except Exception as e:
+                        logger.warning(f"[OHLCV] yfinance fallback chunk {i} failed: {e}")
+                logger.info(f"[OHLCV] yfinance fallback covered {total_cached}/{len(missing)} remaining tickers")
+            except Exception as e:
+                logger.error(f"[OHLCV] yfinance fallback failed: {e}")
 
     def _get_ohlcv(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Return cached OHLCV df; fetch individually if not cached."""
+        """Return cached OHLCV df; fetch individually if not cached.
+        Alpaca primary, yfinance fallback — same as prefetch_ohlcv."""
         if ticker in self._ohlcv_cache:
             return self._ohlcv_cache[ticker]
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockBarsRequest
+            from alpaca.data.timeframe import TimeFrame
+            key = os.environ.get('ALPACA_API_KEY', '')
+            secret = os.environ.get('ALPACA_API_SECRET', '')
+            if key and secret:
+                client = StockHistoricalDataClient(key, secret)
+                req = StockBarsRequest(
+                    symbol_or_symbols=ticker,
+                    timeframe=TimeFrame.Day,
+                    start=datetime.utcnow() - timedelta(days=400),
+                    end=datetime.utcnow(),
+                    feed=self._get_alpaca_feed(),
+                    adjustment='all',
+                )
+                raw = client.get_stock_bars(req).df
+                if not raw.empty and ticker in raw.index.get_level_values(0):
+                    tdf = raw.loc[ticker]
+                    df = tdf[['close', 'high', 'low', 'open', 'volume']].dropna(subset=['close'])
+                    if len(df) >= 20:
+                        self._ohlcv_cache[ticker] = df
+                        return df
+        except Exception as e:
+            logger.debug(f"[OHLCV] Alpaca single-ticker fetch failed for {ticker}: {e}")
         try:
             import yfinance as yf
             raw = yf.download(ticker, period='1y', interval='1d',
