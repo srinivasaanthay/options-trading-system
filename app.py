@@ -1166,6 +1166,24 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
                              ticker, gap * 100)
                 continue
 
+        # Sanity check — a live price must fall within its own day's
+        # high/low (already fetched this same scan via the same Alpaca
+        # snapshot call). If it doesn't, the price itself is bad — a stale
+        # or mismatched fetch (e.g. yfinance falling back to a prior
+        # session for one ticker) rather than a real move. MSTR showed
+        # $115.74 in one scan while its real intraday range that day was
+        # $119.38-$127.90 — nowhere close to Friday's prior-session data
+        # it apparently returned; the gap check above didn't catch it
+        # because $115.74 wasn't an implausible jump from prev_close,
+        # just wrong. Small buffer for bid/ask spread and rounding.
+        today_high, today_low = intraday_extremes_map.get(ticker, (None, None))
+        if today_high and today_low and today_high > 0 and today_low > 0:
+            if price < today_low * 0.97 or price > today_high * 1.03:
+                logger.warning(
+                    "[SP500] %s skipped — price $%.2f outside today's own range $%.2f-$%.2f (bad fetch)",
+                    ticker, price, today_low, today_high)
+                continue
+
         candidates.append((ticker, float(price)))
 
     # Pass 2 — the expensive part, run concurrently across a thread pool.
