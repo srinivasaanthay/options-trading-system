@@ -643,7 +643,7 @@ def _generate_thesis(ticker: str, action: str, score: float, confidence: str,
             f"forecast of which one happens, just what the current numbers support on each side."
         )
 
-    return "\n\n".join(paragraphs)
+    return " ".join(paragraphs)
 
 
 def _append_catalyst_narrative(thesis: str, ticker: str, catalyst_age_days: int,
@@ -674,7 +674,7 @@ def _append_catalyst_narrative(thesis: str, ticker: str, catalyst_age_days: int,
         )
     else:
         return thesis
-    return thesis + "\n\n" + addition
+    return thesis + " " + addition
 
 
 def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[str], List[str]]:
