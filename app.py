@@ -1851,6 +1851,57 @@ async def get_sp500_history(
     }
 
 
+def _compute_consistent_tickers() -> List[Dict]:
+    """Rank tickers by how many of today's hourly snapshots they appeared in
+    — built from the same hourly_snapshots already collected for /history.
+    A ticker that's been a top-10 signal across several independent scan
+    cycles is a stronger, more validated signal than one that spiked once
+    and vanished; this surfaces that pattern directly instead of requiring
+    the user to manually flip through hours and compare."""
+    if not hourly_snapshots:
+        return []
+    total_scans = len(hourly_snapshots)
+    latest_tickers = {r['ticker'] for r in hourly_snapshots[0]['recommendations']}
+
+    ticker_data: Dict[str, Dict] = {}
+    for snap in reversed(hourly_snapshots):  # oldest first, so first_seen is correct
+        for r in snap['recommendations']:
+            t = r['ticker']
+            if t not in ticker_data:
+                ticker_data[t] = {'ticker': t, 'count': 0, 'first_seen_hour': snap['hour_label']}
+            ticker_data[t]['count'] += 1
+            ticker_data[t]['action'] = r['action']
+            ticker_data[t]['latest_score'] = r['score']
+            ticker_data[t]['latest_hour'] = snap['hour_label']
+
+    results = [
+        {
+            'ticker': d['ticker'],
+            'action': d['action'],
+            'appearances': d['count'],
+            'total_scans': total_scans,
+            'first_seen_hour': d['first_seen_hour'],
+            'still_active': d['ticker'] in latest_tickers,
+            'latest_score': d['latest_score'],
+        }
+        for d in ticker_data.values()
+    ]
+    results.sort(key=lambda x: (-x['appearances'], -x['latest_score']))
+    return results
+
+
+@app.get("/api/v1/sp500/consistent-tickers")
+async def get_consistent_tickers(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Tickers ranked by how consistently they've shown up as a top signal
+    today, replacing the old hour-by-hour history browser with a direct
+    answer to 'what's been reliably strong today' instead of raw snapshots
+    the user had to cross-reference manually."""
+    results = _compute_consistent_tickers()
+    return {"count": len(results), "tickers": results}
+
+
 @app.post("/api/v1/sp500/push-results")
 async def push_sp500_results(
     payload: dict,
@@ -2455,27 +2506,6 @@ async def get_stock_signals(
         "count": len(recs),
         "signals": [asdict(r) for r in recs],
     }
-
-
-@app.post("/api/v1/stock-trading/execute-now")  # TEST ONLY — remove after testing
-async def execute_stock_trades_now(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    st: StockTradingService = Depends(_require_stock_trader),
-):
-    """Execute stock trades from the latest CALL signals (market hours only).
-    dry_run=True by default — set STOCK_ORDERS_ENABLED=true env var to place real orders."""
-    if not _is_market_open():
-        now_et = datetime.now(_ET)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Market is closed ({now_et.strftime('%H:%M %Z')}). Trading only allowed 9:30–16:00 ET Mon–Fri."
-        )
-    if not latest_options_recs:
-        raise HTTPException(status_code=404, detail="No SP500 recommendations available yet")
-    rec_dicts = [asdict(r) for r in latest_options_recs]
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, st.execute_signals, rec_dicts)
-    return {"trades_executed": len(results), "trades": results, "dry_run": st.dry_run}
 
 
 @app.post("/api/v1/stock-trading/close-all")
