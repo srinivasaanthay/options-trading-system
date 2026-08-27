@@ -1364,9 +1364,12 @@ def _fallback_price(ticker: str) -> float:
 # that I/O, which is why a scan could take 10+ minutes once the 20-min
 # options-chain cache expired. Running it through a real thread pool lets
 # up to ANALYZE_CONCURRENCY tickers' worth of blocking yfinance/Alpaca calls
-# be in flight at once. Kept modest (not e.g. 50+) because yfinance has no
-# official rate limit and aggressive concurrency risks Yahoo throttling.
-ANALYZE_CONCURRENCY = 8
+# be in flight at once. Raised from 8 to 16 alongside the ticker-universe
+# expansion (dynamic_tickers.py, ~431 -> ~1,650 tickers) to keep the scan
+# comfortably inside the 2-min cycle. Still kept modest rather than 50+
+# because yfinance has no official rate limit and aggressive concurrency
+# risks Yahoo throttling.
+ANALYZE_CONCURRENCY = 16
 _ANALYZE_EXECUTOR = ThreadPoolExecutor(max_workers=ANALYZE_CONCURRENCY, thread_name_prefix="analyze")
 
 

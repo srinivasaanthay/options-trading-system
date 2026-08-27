@@ -1,11 +1,12 @@
 """
-Dynamic ticker universe — fetches top 500 US stocks with liquid options
-every trading day instead of using a static S&P 500 list.
+Dynamic ticker universe — fetches every liquid US stock meeting quality
+filters, every trading day, instead of using a static S&P 500 list.
 
-Criteria:
+Criteria (all must hold — this is the actual gate, not TARGET_COUNT below):
 - Market cap > $2B
+- Share price > $5 (explicit penny-stock exclusion, on top of the market-cap floor)
 - Avg daily volume (3m) > 500k shares
-- Listed on major US exchanges (NMS, NYQ, NGM)
+- Listed on major US exchanges (NMS, NYQ, NGM, PCX)
 - Ranked by: market cap (40%) + avg volume (40%) + options availability (20%)
 """
 
@@ -21,25 +22,39 @@ logger = logging.getLogger(__name__)
 
 _cached_tickers: List[str] = []
 _cache_date: date = None
-TARGET_COUNT = 500
+TARGET_COUNT = 3000  # safety ceiling only — the quality filters above are the
+                      # real gate; ~1,650 tickers currently qualify, well under this
 
 
-def _fetch_exchange(exchange: str, size: int = 250) -> List[dict]:
+def _fetch_exchange(exchange: str, page_size: int = 250) -> List[dict]:
+    """Yahoo caps a single screener call at 250 results, so page through
+    `offset` to get everything that matches — not just the first page."""
     try:
         q = EquityQuery('and', [
             EquityQuery('gt', ['intradaymarketcap', 2_000_000_000]),
             EquityQuery('gt', ['avgdailyvol3m', 500_000]),
+            EquityQuery('gt', ['intradayprice', 5]),
             EquityQuery('eq', ['exchange', exchange]),
         ])
-        result = yf.screen(q, size=size, sortField='intradaymarketcap', sortAsc=False)
-        return result.get('quotes', [])
+        quotes: List[dict] = []
+        offset = 0
+        while True:
+            result = yf.screen(q, offset=offset, size=page_size, sortField='intradaymarketcap', sortAsc=False)
+            page = result.get('quotes', [])
+            quotes.extend(page)
+            total = result.get('total', len(quotes))
+            offset += page_size
+            if offset >= total or not page:
+                break
+        return quotes
     except Exception as e:
         logger.warning(f"Screener failed for {exchange}: {e}")
         return []
 
 
 def get_dynamic_tickers(force_refresh: bool = False) -> List[str]:
-    """Return top 500 US stocks with liquid options. Cached per trading day."""
+    """Return every liquid US stock meeting the quality filters above (see
+    module docstring), ranked and capped at TARGET_COUNT. Cached per trading day."""
     global _cached_tickers, _cache_date
 
     today = date.today()
@@ -52,7 +67,7 @@ def get_dynamic_tickers(force_refresh: bool = False) -> List[str]:
     # Fetch from multiple exchanges to get broad coverage
     quotes = []
     for exchange in ['NMS', 'NYQ', 'NGM', 'PCX']:
-        batch = _fetch_exchange(exchange, size=250)
+        batch = _fetch_exchange(exchange)
         quotes.extend(batch)
         logger.info(f"  {exchange}: {len(batch)} stocks")
 
