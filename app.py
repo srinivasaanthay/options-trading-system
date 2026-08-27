@@ -214,6 +214,21 @@ def _next_monthly_expiry(from_date: datetime = None) -> str:
     return third_friday.strftime("%Y-%m-%d")
 
 
+def _is_price_plausible(price: float, today_low: Optional[float], today_high: Optional[float]) -> bool:
+    """A live price must fall within its own day's high/low (small buffer
+    for bid/ask spread and rounding) — extracted as its own testable
+    function after a real bug: MSTR showed $115.74 in one scan while its
+    real intraday range that day was $119.38-$127.90, a stale/mismatched
+    fetch (yfinance falling back to a prior session) that the prev-close
+    gap check didn't catch because $115.74 wasn't an implausible jump from
+    the prior close, just wrong. Returns True (plausible) whenever
+    today_low/today_high aren't both available — this check only rejects
+    a price when it has real data to check it against."""
+    if not today_low or not today_high or today_low <= 0 or today_high <= 0:
+        return True
+    return today_low * 0.97 <= price <= today_high * 1.03
+
+
 def _strike_for_action(price: float, action: str) -> float:
     """Round to nearest $5 strike, slight OTM for call or put."""
     rounded = round(price / 5) * 5
@@ -1421,14 +1436,13 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
         # $119.38-$127.90 — nowhere close to Friday's prior-session data
         # it apparently returned; the gap check above didn't catch it
         # because $115.74 wasn't an implausible jump from prev_close,
-        # just wrong. Small buffer for bid/ask spread and rounding.
+        # just wrong.
         today_high, today_low = intraday_extremes_map.get(ticker, (None, None))
-        if today_high and today_low and today_high > 0 and today_low > 0:
-            if price < today_low * 0.97 or price > today_high * 1.03:
-                logger.warning(
-                    "[SP500] %s skipped — price $%.2f outside today's own range $%.2f-$%.2f (bad fetch)",
-                    ticker, price, today_low, today_high)
-                continue
+        if not _is_price_plausible(price, today_low, today_high):
+            logger.warning(
+                "[SP500] %s skipped — price $%.2f outside today's own range $%.2f-$%.2f (bad fetch)",
+                ticker, price, today_low or 0.0, today_high or 0.0)
+            continue
 
         candidates.append((ticker, float(price)))
 
