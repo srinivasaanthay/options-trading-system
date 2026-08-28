@@ -32,6 +32,7 @@ import os
 import math
 import hashlib
 import random
+import re
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Depends, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -1611,7 +1612,14 @@ async def _sp500_scheduler_loop():
             first_scan_done = True
 
         try:
-            recs = await _analyze_sp500_options()  # also executes paper trades internally
+            # Wrapped in a timeout — without one, a single abnormally slow
+            # cycle (observed in production: ~4 hours, likely driven by
+            # repeated yfinance retries against a garbage ticker) blocks this
+            # loop forever, since try/except only catches raised errors, not
+            # a hang. 90s leaves real headroom over the ~30-60s happy-path
+            # scan time while staying under the 120s cycle interval, so a
+            # timeout can never cascade into the next cycle also stalling.
+            recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=90)  # also executes paper trades internally
 
             # Push to all connected WebSocket clients
             if options_ws_connections and recs:
@@ -1642,6 +1650,8 @@ async def _sp500_scheduler_loop():
                 except Exception as e:
                     logger.warning(f"[Scheduler] stock trade execution failed: {e}")
 
+        except asyncio.TimeoutError:
+            logger.error("[SP500 Scheduler] Scan cycle exceeded 90s timeout — skipping to next cycle")
         except Exception as e:
             logger.error(f"[SP500 Scheduler] Error: {e}")
 
@@ -2064,7 +2074,14 @@ async def analyze_stock(
     if not stock_agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    ticker = symbol.upper()
+    # .strip() matters here — a client-side autocorrect/QuickType bug was
+    # observed sending tickers like "NVDA " (trailing space) or even
+    # replacing one outright with an unrelated word, which yfinance then
+    # retried repeatedly against a nonexistent symbol. Fixed client-side too,
+    # but stripping here means a bad client can never degrade this endpoint.
+    ticker = symbol.strip().upper()
+    if not ticker or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
+        raise HTTPException(status_code=400, detail=f"'{symbol}' doesn't look like a valid ticker symbol")
     try:
         loop = asyncio.get_event_loop()
 

@@ -12,6 +12,7 @@ Criteria (all must hold — this is the actual gate, not TARGET_COUNT below):
 
 import logging
 import math
+import re
 from datetime import date
 from typing import List
 
@@ -71,12 +72,17 @@ def get_dynamic_tickers(force_refresh: bool = False) -> List[str]:
         quotes.extend(batch)
         logger.info(f"  {exchange}: {len(batch)} stocks")
 
-    # Deduplicate by symbol
+    # Deduplicate by symbol, and reject anything that isn't a real ticker
+    # shape (1-5 uppercase letters). Belt-and-suspenders: the actual garbage
+    # seen in production ("MCDANIEL", "NVDA " with a trailing space) came
+    # from a separate iOS input bug, not this screener, but validating here
+    # too means a bad row from Yahoo can never reach yfinance lookups either.
+    _TICKER_RE = re.compile(r'^[A-Z]{1,5}$')
     seen = set()
     unique = []
     for q in quotes:
         sym = q.get('symbol', '')
-        if sym and sym not in seen and '.' not in sym and '-' not in sym:
+        if sym and sym not in seen and _TICKER_RE.match(sym):
             seen.add(sym)
             unique.append(q)
 
