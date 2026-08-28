@@ -2040,6 +2040,18 @@ async def refresh_sp500_now(
 # PHASE 3A: ANALYSIS ENDPOINTS
 # ============================================================================
 
+def _validate_ticker_symbol(raw: str) -> str:
+    """Strip + uppercase + shape-check a user-supplied ticker before it ever
+    reaches a yfinance/Alpaca lookup. Production logs showed garbage like
+    "NVDA " (trailing space, from iOS autocorrect) and "MCDANIEL" (a
+    surname) reaching these calls and burning minutes on repeated failed
+    retries — this rejects that shape of input immediately instead."""
+    ticker = raw.strip().upper()
+    if not ticker or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
+        raise HTTPException(status_code=400, detail=f"'{raw}' doesn't look like a valid ticker symbol")
+    return ticker
+
+
 @app.get("/api/v1/quote/{ticker}")
 async def get_quote(
     ticker: str,
@@ -2050,11 +2062,12 @@ async def get_quote(
     to guess it (the Analysis tab's old behavior)."""
     if not credentials:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    ticker = _validate_ticker_symbol(ticker)
     loop = asyncio.get_event_loop()
-    price = await loop.run_in_executor(None, _fallback_price, ticker.upper())
+    price = await loop.run_in_executor(None, _fallback_price, ticker)
     if not price or price <= 0:
-        raise HTTPException(status_code=404, detail=f"No price available for {ticker.upper()}")
-    return {"ticker": ticker.upper(), "price": round(price, 2)}
+        raise HTTPException(status_code=404, detail=f"No price available for {ticker}")
+    return {"ticker": ticker, "price": round(price, 2)}
 
 
 @app.post("/api/v1/analyze")
@@ -2074,14 +2087,7 @@ async def analyze_stock(
     if not stock_agent:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
-    # .strip() matters here — a client-side autocorrect/QuickType bug was
-    # observed sending tickers like "NVDA " (trailing space) or even
-    # replacing one outright with an unrelated word, which yfinance then
-    # retried repeatedly against a nonexistent symbol. Fixed client-side too,
-    # but stripping here means a bad client can never degrade this endpoint.
-    ticker = symbol.strip().upper()
-    if not ticker or not re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", ticker):
-        raise HTTPException(status_code=400, detail=f"'{symbol}' doesn't look like a valid ticker symbol")
+    ticker = _validate_ticker_symbol(symbol)
     try:
         loop = asyncio.get_event_loop()
 
@@ -2604,7 +2610,8 @@ async def websocket_sp500_options(websocket: WebSocket):
     """
     Real-time WebSocket for SP500 options recommendations.
 
-    Sends a snapshot immediately on connect, then pushes updates every 20 min.
+    Sends a snapshot immediately on connect, then pushes updates on every
+    scan cycle (~2 min during market hours — see SP500_SCAN_INTERVAL).
     Each message has the structure:
       {
         "event": "sp500_options_update",
@@ -2629,7 +2636,7 @@ async def websocket_sp500_options(websocket: WebSocket):
         else:
             await websocket.send_json({
                 "event": "sp500_options_waiting",
-                "message": "First analysis in progress, results will arrive within 20 min",
+                "message": "First analysis in progress, results will arrive within ~2 min",
                 "timestamp": datetime.utcnow().isoformat(),
             })
 
