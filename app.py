@@ -1065,6 +1065,23 @@ def _get_pg_conn():
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
             """)
+            # Deliberately lean (no thesis/fundamentals/key_factors blob) —
+            # this exists to answer "what did we score ticker X at time Y",
+            # not to replay the full analysis. Kept to the last 2 distinct
+            # trading dates only (see _prune_scan_history), so row count
+            # stays bounded regardless of how long the app has been running.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scan_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    ticker TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    score DOUBLE PRECISION NOT NULL,
+                    current_price DOUBLE PRECISION NOT NULL,
+                    scan_time TIMESTAMPTZ NOT NULL
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_ticker_time ON scan_history (ticker, scan_time)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_time ON scan_history (scan_time)")
         _pg_conn.commit()
         return _pg_conn
     except Exception as e:
@@ -1093,6 +1110,34 @@ def _save_results_pg():
         conn.commit()
     except Exception as e:
         logger.warning(f"[Postgres] Save failed: {e}")
+
+
+def _save_scan_history_pg():
+    """One row per rec, per scan cycle — the actual history that answers
+    'what did Arka score X at time Y', which the single-row latest_scan
+    table above can never answer since each cycle overwrites it. Pruned to
+    the 2 most recent distinct trading dates on every call so this can run
+    indefinitely without unbounded growth."""
+    conn = _get_pg_conn()
+    if conn is None or not latest_options_recs:
+        return
+    try:
+        scan_time = last_sp500_run or datetime.utcnow()
+        rows = [(r.ticker, r.action, r.score, r.current_price, scan_time) for r in latest_options_recs]
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO scan_history (ticker, action, score, current_price, scan_time) VALUES (%s, %s, %s, %s, %s)",
+                rows,
+            )
+            cur.execute("""
+                DELETE FROM scan_history
+                WHERE scan_time::date NOT IN (
+                    SELECT DISTINCT scan_time::date FROM scan_history ORDER BY scan_time::date DESC LIMIT 2
+                )
+            """)
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[Postgres] scan_history save failed: {e}")
 
 
 def _load_results_pg() -> bool:
@@ -1520,6 +1565,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     latest_options_recs = top_recs
     last_sp500_run = datetime.utcnow()
     _save_results()  # survive a Railway restart mid-day, same as pushed results already did
+    _save_scan_history_pg()  # one row per rec — separate from the single-row latest_scan above
 
     logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept"
                 + (f" ({gap_skipped} skipped — already gapped >{GAP_RISK_PCT*100:.0f}%)" if gap_skipped else ""))
@@ -1929,6 +1975,56 @@ async def get_consistent_tickers(
     return {"count": len(results), "tickers": results}
 
 
+@app.get("/api/v1/sp500/scan-history")
+async def get_scan_history(
+    ticker: Optional[str] = None,
+    date: Optional[str] = None,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Real per-cycle scan history — answers 'what did Arka score ticker X
+    at time Y' for the last 2 trading days (older rows are pruned; see
+    _save_scan_history_pg). Unlike /consistent-tickers and /history, this
+    survives past the current trading day, since it's a real Postgres
+    table rather than an in-memory list that resets daily.
+
+    ticker: optional, case-insensitive exact match (e.g. "NOW").
+    date: optional, YYYY-MM-DD (America/New_York), filters to that trading day.
+    Both omitted returns everything still retained (up to 2 trading days)."""
+    conn = _get_pg_conn()
+    if conn is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    where = []
+    params: list = []
+    if ticker:
+        where.append("ticker = %s")
+        params.append(ticker.strip().upper())
+    if date:
+        where.append("scan_time::date = %s")
+        params.append(date)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT ticker, action, score, current_price, scan_time FROM scan_history {clause} "
+                f"ORDER BY scan_time DESC LIMIT 2000",
+                params,
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.warning(f"[Postgres] scan_history query failed: {e}")
+        raise HTTPException(status_code=500, detail="Query failed")
+
+    return {
+        "count": len(rows),
+        "entries": [
+            {"ticker": r[0], "action": r[1], "score": r[2], "current_price": r[3], "scan_time": r[4].isoformat()}
+            for r in rows
+        ],
+    }
+
+
 @app.post("/api/v1/sp500/push-results")
 async def push_sp500_results(
     payload: dict,
@@ -1976,6 +2072,7 @@ async def push_sp500_results(
     latest_options_recs = sorted(recs, key=lambda x: x.score, reverse=True)
     last_sp500_run = datetime.utcnow()
     _save_results()
+    _save_scan_history_pg()
     logger.info(f"[push-results] Received {len(latest_options_recs)} recommendations from local runner")
     return {"received": len(latest_options_recs), "timestamp": last_sp500_run.isoformat()}
 
