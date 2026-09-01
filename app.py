@@ -1989,7 +1989,17 @@ async def get_scan_history(
 
     ticker: optional, case-insensitive exact match (e.g. "NOW").
     date: optional, YYYY-MM-DD (America/New_York), filters to that trading day.
-    Both omitted returns everything still retained (up to 2 trading days)."""
+    Both omitted returns everything still retained (up to 2 trading days).
+
+    Row cap is 25,000 — comfortably above a single day's realistic maximum
+    (~100 recs x ~195 cycles ~= 19,500) so an unfiltered date query never
+    silently truncates in normal operation, while still bounding a
+    pathological case. The response's `truncated` flag makes it explicit
+    either way, since a query that appeared to return "everything" but was
+    actually cut off (a real bug found 2026-08-31 with the old 2,000 cap
+    — a query for a whole day's data silently returned only its most
+    recent slice, with no signal that anything was missing) is worse than
+    one that visibly tells you it hit the cap."""
     conn = _get_pg_conn()
     if conn is None:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -2003,13 +2013,14 @@ async def get_scan_history(
         where.append("scan_time::date = %s")
         params.append(date)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
+    row_cap = 25000
 
     try:
         with conn.cursor() as cur:
             cur.execute(
                 f"SELECT ticker, action, score, current_price, scan_time FROM scan_history {clause} "
-                f"ORDER BY scan_time DESC LIMIT 2000",
-                params,
+                f"ORDER BY scan_time DESC LIMIT %s",
+                params + [row_cap],
             )
             rows = cur.fetchall()
     except Exception as e:
@@ -2018,6 +2029,7 @@ async def get_scan_history(
 
     return {
         "count": len(rows),
+        "truncated": len(rows) == row_cap,
         "entries": [
             {"ticker": r[0], "action": r[1], "score": r[2], "current_price": r[3], "scan_time": r[4].isoformat()}
             for r in rows
