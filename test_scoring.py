@@ -42,7 +42,7 @@ def make_analysis_result(**overrides):
         buy_signal=BuySignal.ACCUMULATE,
         iv_rank=50.0, volume_ratio=1.0, rs_vs_spy=0.0,
         fundamental_score=0.5, analyst_upside=0.0, days_to_earnings=999,
-        rsi=50.0, market_score=0.5,
+        rsi=50.0, market_score=0.5, avg_dollar_volume=0.0,
     )
     defaults.update(overrides)
     return types.SimpleNamespace(**defaults)
@@ -168,6 +168,29 @@ def test_make_options_rec_populates_key_factors_and_risks():
     rec = _make_options_rec("AAPL", result, price=200.0)
     assert isinstance(rec.key_factors, list) and len(rec.key_factors) > 0
     assert isinstance(rec.risks, list) and len(rec.risks) > 0
+
+
+def test_make_options_rec_day_change_pct_uses_prev_close_not_intraday_extremes():
+    """day_change_pct is today's overall move vs prior close — independent
+    of today_high/today_low (which only affect intraday_move_pct/score)."""
+    result = make_analysis_result(technical_score=0.75, rs_vs_spy=3.0)
+    rec = _make_options_rec("AAPL", result, price=106.0, prev_close=100.0)
+    assert rec.day_change_pct == 6.0
+
+
+def test_make_options_rec_day_change_pct_defaults_to_zero_without_prev_close():
+    result = make_analysis_result(technical_score=0.75, rs_vs_spy=3.0)
+    rec = _make_options_rec("AAPL", result, price=106.0)
+    assert rec.day_change_pct == 0.0
+
+
+def test_make_options_rec_avg_dollar_volume_passthrough():
+    """Absolute, cross-ticker liquidity measure — distinct from volume_ratio,
+    which is self-relative and can't tell a genuinely liquid stock (e.g.
+    NVDA) apart from a thin one (e.g. TORM) having a busier-than-usual day."""
+    result = make_analysis_result(technical_score=0.75, avg_dollar_volume=5_000_000_000.0)
+    rec = _make_options_rec("NVDA", result, price=200.0)
+    assert rec.avg_dollar_volume == 5_000_000_000.0
 
 
 # ── _generate_thesis — direction-consistency, the specific bug from earlier ─

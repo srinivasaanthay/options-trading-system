@@ -186,6 +186,11 @@ class OptionsRecommendation:
     intraday_move_pct: float = 0.0     # % faded off today's high (CALL) or bounced off today's low (PUT)
     key_factors: list = None  # see _generate_key_factors_and_risks — same real signals that drive `score`
     risks: list = None
+    day_change_pct: float = 0.0        # today's overall % move vs prior close — regardless of
+                                        # direction/reversal, unlike intraday_move_pct above
+    avg_dollar_volume: float = 0.0     # 20d avg shares x price — absolute liquidity/"how fast
+                                        # does this normally move" measure, not self-relative
+                                        # like volume_ratio
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -768,11 +773,13 @@ def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[st
 
 
 def _make_options_rec(ticker: str, analysis_result, price: float,
-                       today_high: float = None, today_low: float = None) -> OptionsRecommendation:
+                       today_high: float = None, today_low: float = None,
+                       prev_close: float = None) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
     today_high/today_low (optional — from _fetch_intraday_extremes_batch) let a same-day
     reversal dampen the score even though the technical component below is daily-bar-based
-    and can't see it on its own."""
+    and can't see it on its own. prev_close (optional — from _fetch_prev_closes_batch) is
+    informational only (day_change_pct below) — does not affect score."""
     is_bearish = (analysis_result.technical_score < 0.48 or
                   analysis_result.buy_signal in [BuySignal.HOLD, BuySignal.AVOID])
     action = "PUT" if is_bearish else "CALL"
@@ -866,6 +873,8 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         analyst_upside=round(getattr(analysis_result, 'analyst_upside', 0.0), 1),
         long_term_score=long_term_score,
         intraday_move_pct=intraday_move_pct,
+        day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
+        avg_dollar_volume=round(getattr(analysis_result, 'avg_dollar_volume', 0.0), 0),
     )
     # Computed here so every scanned rec carries them (cheap, no network calls)
     # — not just the ones enriched with catalyst data later. See call sites
@@ -1522,7 +1531,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             is_bearish = result.technical_score <= 0.45
             if is_bullish or is_bearish:
                 t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
-                rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low)
+                rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
+                                         prev_close=prev_close_map.get(ticker))
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
@@ -2210,9 +2220,11 @@ async def analyze_stock(
         await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, [ticker, "SPY"])
         extremes = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, [ticker])
         t_high, t_low = extremes.get(ticker, (None, None))
+        prev_closes = await loop.run_in_executor(None, _fetch_prev_closes_batch, [ticker])
 
         result = await stock_agent.analyze_ticker(ticker, float(use_price))
-        rec = _make_options_rec(ticker, result, float(use_price), today_high=t_high, today_low=t_low)
+        rec = _make_options_rec(ticker, result, float(use_price), today_high=t_high, today_low=t_low,
+                                 prev_close=prev_closes.get(ticker))
         rec.news_headlines = await loop.run_in_executor(None, _fetch_ticker_news, ticker)
         age_days, pct_change = _compute_catalyst_freshness(ticker, rec.news_headlines, rec.current_price)
         rec.catalyst_age_days = age_days if age_days is not None else -1

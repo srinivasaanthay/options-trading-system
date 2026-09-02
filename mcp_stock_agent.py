@@ -119,6 +119,11 @@ class AnalysisResult:
     rsi: float = 50.0               # 14-day RSI — was computed for scoring and discarded;
                                      # exposed so narrative text can say whether a move is
                                      # fresh (room to continue) or already stretched (>70/<30)
+    avg_dollar_volume: float = 0.0  # 20d avg shares x price — absolute, cross-ticker
+                                     # liquidity/"how fast does this normally move" measure,
+                                     # unlike volume_ratio which is self-relative to the
+                                     # ticker's own history and can't distinguish a genuinely
+                                     # liquid stock from a thin one having a busy day
 
 
 @dataclass
@@ -306,6 +311,7 @@ class MCPStockAgent:
                 analyst_upside=fundamental.get('analyst_upside', 0.0),
                 short_interest_pct=fundamental.get('short_interest_pct', 0.0),
                 rsi=technical_data.get('rsi', 50.0),
+                avg_dollar_volume=technical_data.get('avg_dollar_volume', 0.0),
             )
 
             # Store in history
@@ -797,12 +803,19 @@ class MCPStockAgent:
 
         # ── Volume confirmation ──────────────────────────────────────────────
         volume_ratio = 1.0
+        avg_dollar_volume = 0.0  # 20d avg shares x price — an absolute, cross-
+        # ticker liquidity measure. volume_ratio above is deliberately
+        # self-relative (today vs this ticker's own history) so it can't
+        # tell a genuinely high-volume stock apart from a thin one having a
+        # busier-than-usual day; this uses the same avg_vol already computed
+        # below, no extra fetch needed.
         if df is not None and 'volume' in df.columns and len(df) >= 20:
             vol = df['volume'].astype(float)
             avg_vol = float(vol.rolling(20).mean().iloc[-1])
             cur_vol = float(vol.iloc[-1])
             if avg_vol > 0:
                 volume_ratio = round(cur_vol / avg_vol, 2)
+                avg_dollar_volume = round(avg_vol * price, 0)
 
         # ── Relative strength vs SPY ─────────────────────────────────────────
         rs_vs_spy = 0.0
@@ -853,6 +866,7 @@ class MCPStockAgent:
             'rsi': rsi,
             'macd_hist': macd_hist,
             'volume_ratio': volume_ratio,
+            'avg_dollar_volume': avg_dollar_volume,
             'rs_vs_spy': rs_vs_spy,
             'support_resistance': {
                 'support': (sma20 or price) * 0.98,
