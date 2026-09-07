@@ -13,7 +13,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from enum import Enum
 
 from analyzer.news_analyzer import NewsAnalyzer
@@ -167,6 +167,32 @@ class MCPStockAgent:
         BuySignal.HOLD: 0.50,
     }
 
+    # News sentiment keyword sets — shared by the broad market-wide fetch
+    # and the per-ticker path, so both score headlines identically.
+    # Strong, specific signals only — generic market words removed to avoid
+    # inflating sentiment from broad "stocks higher today" headlines.
+    _BULLISH_WORDS = {
+        'beat', 'beats', 'upgrade', 'upgraded', 'outperform',
+        'buy', 'bullish', 'breakthrough', 'milestone', 'record',
+        'profit', 'profits', 'soars', 'soared', 'surges', 'surged', 'surge',
+        'jumps', 'jumped', 'raises', 'raised', 'boosted', 'accelerates',
+        'expansion', 'rallies', 'rallied',
+    }
+    _BEARISH_WORDS = {
+        'miss', 'misses', 'missed', 'cut', 'cuts', 'downgrade', 'downgraded',
+        'layoff', 'layoffs', 'loss', 'losses', 'weak', 'disappoints', 'disappointed',
+        'warning', 'recall', 'investigation', 'fine', 'penalty',
+        'drops', 'dropped', 'bearish', 'sell', 'reduces', 'reduced',
+        'shrinks', 'slumps', 'slumped', 'slides', 'tumbles', 'tumbled',
+        'probe', 'lawsuit', 'bankruptcy', 'decline', 'declines',
+    }
+    # General-market openers — articles starting with these are index/macro
+    # news, not company news, and shouldn't affect per-ticker sentiment.
+    _MARKET_OPENERS = {
+        'stocks', 's&p', 'dow', 'nasdaq', 'market', 'wall', 'futures',
+        'global', 'asian', 'european', 'fed', 'investors', 'treasury',
+    }
+
     def __init__(self):
         """Initialize agent with all analyzers"""
         logger.info("Initializing MCP Stock Agent")
@@ -191,7 +217,7 @@ class MCPStockAgent:
         self._market_cache: Dict = {}
         self._market_cache_time: Optional[datetime] = None
         self._options_cache: Dict[str, Tuple[Dict, datetime]] = {}
-        self._news_cache: Dict[str, Tuple[Dict, datetime]] = {}
+        self._broad_news_cache: Optional[Tuple[Dict[str, Dict], datetime]] = None
         self._earnings_cache: Dict[str, Tuple[int, datetime]] = {}    # ticker → (days_to_earn, fetched_at)
         self._fundamental_cache: Dict[str, Tuple[Dict, datetime]] = {} # ticker → (data, fetched_at)
 
@@ -874,107 +900,106 @@ class MCPStockAgent:
             }
         }
 
-    def _fetch_real_news_data(self, ticker: str) -> Dict:
-        """Score sentiment from real yfinance news headlines with keyword analysis."""
-        # Check cache (30-min TTL — news changes slowly)
+    def _score_headlines(self, headlines: List[str]) -> Optional[Dict]:
+        """Keyword-score a batch of headlines for one ticker. Returns None if
+        no headline produced a signal (caller decides the neutral fallback)."""
+        bullish = bearish = 0
+        for title in headlines:
+            if not title:
+                continue
+            parts = title.lower().split()
+            first_word = parts[0].strip('.,!?:;"\'') if parts else ''
+            if first_word in self._MARKET_OPENERS:
+                continue
+            words = {w.strip('.,!?:;"\'') for w in parts}
+            bullish += len(words & self._BULLISH_WORDS)
+            bearish += len(words & self._BEARISH_WORDS)
+
+        total = bullish + bearish
+        if total == 0:
+            return None
+
+        raw = (bullish - bearish) / total
+        sentiment = max(-1.0, min(1.0, raw * 2.0))
+        strength = min(1.0, total / 10.0 + 0.3)
+        trend = ('improving' if sentiment > 0.1
+                 else 'deteriorating' if sentiment < -0.1 else 'stable')
+        return {
+            'overall_sentiment': sentiment,
+            'strength': strength,
+            'recency_score': 0.9,
+            'trend': trend,
+            'news_count': len(headlines),
+        }
+
+    def _fetch_broad_market_news(self) -> Dict[str, Dict]:
+        """One market-wide news pull (no symbol filter) instead of ~1,650
+        per-ticker calls — Alpaca tags each article with the tickers it's
+        about, so this doubles as the ticker->sentiment map and the
+        discovery feed (see get_news_matched_tickers). Cached 30 min:
+        market-wide headlines don't turn over meaningfully faster than that."""
         now = datetime.utcnow()
-        if ticker in self._news_cache:
-            cached, fetched_at = self._news_cache[ticker]
+        if self._broad_news_cache:
+            cached, fetched_at = self._broad_news_cache
             if (now - fetched_at).total_seconds() < 1800:
                 return cached
 
-        # Strong, specific signals only — generic market words removed to avoid
-        # inflating sentiment from broad "stocks higher today" headlines.
-        BULLISH = {
-            'beat', 'beats', 'upgrade', 'upgraded', 'outperform',
-            'buy', 'bullish', 'breakthrough', 'milestone', 'record',
-            'profit', 'profits', 'soars', 'soared', 'surges', 'surged', 'surge',
-            'jumps', 'jumped', 'raises', 'raised', 'boosted', 'accelerates',
-            'expansion', 'rallies', 'rallied',
-        }
-        BEARISH = {
-            'miss', 'misses', 'missed', 'cut', 'cuts', 'downgrade', 'downgraded',
-            'layoff', 'layoffs', 'loss', 'losses', 'weak', 'disappoints', 'disappointed',
-            'warning', 'recall', 'investigation', 'fine', 'penalty',
-            'drops', 'dropped', 'bearish', 'sell', 'reduces', 'reduced',
-            'shrinks', 'slumps', 'slumped', 'slides', 'tumbles', 'tumbled',
-            'probe', 'lawsuit', 'bankruptcy', 'decline', 'declines',
-        }
-
-        # General-market openers — articles starting with these are index/macro news,
-        # not company news, and shouldn't affect per-ticker sentiment.
-        MARKET_OPENERS = {
-            'stocks', 's&p', 'dow', 'nasdaq', 'market', 'wall', 'futures',
-            'global', 'asian', 'european', 'fed', 'investors', 'treasury',
-        }
-
+        result: Dict[str, Dict] = {}
         try:
-            # Alpaca, not yfinance — yfinance's news endpoint was failing
-            # frequently (~30 errors/day) and always fell through to the
-            # price-momentum fallback below. Same credentials used everywhere
-            # else in this system.
             from alpaca.data.historical.news import NewsClient
             from alpaca.data.requests import NewsRequest
             client = NewsClient(os.environ.get('ALPACA_API_KEY', ''), os.environ.get('ALPACA_API_SECRET', ''))
-            req = NewsRequest(symbols=ticker, limit=15)
+            req = NewsRequest(limit=50)  # no symbols= -> top market-wide news
             articles = client.get_news(req).data.get('news', [])
-            if not articles:
-                raise ValueError("no articles")
 
-            bullish = bearish = 0
-            for article in articles[:15]:
+            headlines_by_ticker: Dict[str, List[str]] = {}
+            for article in articles:
                 title = article.headline or ''
                 if not title:
                     continue
-                # Skip obvious macro/index headlines — they inflate all tickers equally.
-                parts = title.lower().split()
-                first_word = parts[0].strip('.,!?:;"\'') if parts else ''
-                if first_word in MARKET_OPENERS:
-                    continue
-                # Strip punctuation from each token before keyword matching
-                words = {w.strip('.,!?:;"\'') for w in parts}
-                bullish += len(words & BULLISH)
-                bearish += len(words & BEARISH)
+                for sym in (article.symbols or []):
+                    headlines_by_ticker.setdefault(sym, []).append(title)
 
-            total = bullish + bearish
-            if total == 0:
-                raise ValueError("no sentiment signals after market-article filter")
-
-            raw = (bullish - bearish) / total
-            sentiment = max(-1.0, min(1.0, raw * 2.0))
-            strength = min(1.0, total / 10.0 + 0.3)
-            trend = ('improving' if sentiment > 0.1
-                     else 'deteriorating' if sentiment < -0.1 else 'stable')
-
-            result = {
-                'overall_sentiment': sentiment,
-                'strength': strength,
-                'recency_score': 0.9,
-                'trend': trend,
-                'news_count': len(articles)
-            }
-            self._news_cache[ticker] = (result, now)
-            return result
+            for ticker, headlines in headlines_by_ticker.items():
+                scored = self._score_headlines(headlines)
+                if scored is not None:
+                    result[ticker] = scored
 
         except Exception:
-            # Fallback: price-momentum proxy when no news available
-            ind = self._compute_indicators(self._get_ohlcv(ticker))
-            if not ind:
-                return self._generate_news_data()
-            ret5  = ind.get('ret5',  0.0)
-            ret20 = ind.get('ret20', 0.0)
-            sentiment = max(-1.0, min(1.0, (ret5 * 0.6 + ret20 * 0.4) * 4.0))
-            trend = ('improving' if sentiment > 0.1
-                     else 'deteriorating' if sentiment < -0.1 else 'stable')
-            result = {
-                'overall_sentiment': sentiment,
-                'strength': min(1.0, abs(sentiment) * 0.8 + 0.2),
-                'recency_score': 0.6,
-                'trend': trend,
-                'news_count': 0
-            }
-            self._news_cache[ticker] = (result, now)
-            return result
+            logger.warning("Broad market news fetch failed", exc_info=True)
+            # Keep the previous cache (if any) rather than wiping it out on a
+            # transient API failure — a stale-but-real map beats an empty one.
+            if self._broad_news_cache:
+                return self._broad_news_cache[0]
+
+        self._broad_news_cache = (result, now)
+        return result
+
+    def get_news_matched_tickers(self) -> Set[str]:
+        """Tickers named in the current broad-news pull — used to pull
+        breaking-news tickers into the scan even if they didn't clear the
+        normal quality filter yet."""
+        return set(self._fetch_broad_market_news().keys())
+
+    def _fetch_real_news_data(self, ticker: str) -> Dict:
+        """Sentiment for one ticker, sourced from the shared broad market-news
+        pull. No per-ticker API call and no price-momentum fallback: if a
+        ticker wasn't in the latest top-news batch, there's no real signal to
+        report, so it scores neutral rather than a fabricated proxy that would
+        double-count price action already captured by the technical/strategy
+        weights (this covers most tickers most cycles — the broad feed only
+        surfaces the ~50 highest-profile headlines, not full market coverage)."""
+        broad_map = self._fetch_broad_market_news()
+        if ticker in broad_map:
+            return broad_map[ticker]
+
+        return {
+            'overall_sentiment': 0.0,
+            'strength': 0.3,
+            'recency_score': 0.0,
+            'trend': 'stable',
+            'news_count': 0,
+        }
 
     def _fetch_real_market_data(self) -> Dict:
         """Fetch SPY+VIX market regime data; cached for 30 minutes."""
@@ -1195,16 +1220,6 @@ class MCPStockAgent:
     # -----------------------------------------------------------------------
     # Fallback generators (used when yfinance data is unavailable)
     # -----------------------------------------------------------------------
-
-    def _generate_news_data(self) -> Dict:
-        """Fallback: neutral news data"""
-        return {
-            'overall_sentiment': 0.1,
-            'strength': 0.5,
-            'recency_score': 0.8,
-            'trend': 'stable',
-            'news_count': 5
-        }
 
     def _generate_technical_data(self) -> Dict:
         """Fallback: neutral technical data"""

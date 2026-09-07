@@ -1444,6 +1444,17 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     if not tickers:
         tickers = SP500_TICKERS  # fallback to static list
 
+    # Discovery: pull in tickers making breaking news that haven't cleared
+    # the normal market-cap/price/volume quality filter yet. They still go
+    # through the full gap/earnings/technical-score gauntlet below like any
+    # other ticker — this just gives them a chance to be considered at all.
+    news_tickers = await loop.run_in_executor(None, stock_agent.get_news_matched_tickers)
+    discovered = sorted(t for t in news_tickers
+                         if t not in tickers and re.fullmatch(r"[A-Z]{1,5}(\.[A-Z])?", t))
+    if discovered:
+        logger.info(f"[SP500] +{len(discovered)} tickers pulled in from breaking news: {discovered}")
+        tickers = tickers + discovered
+
     logger.info(f"[SP500] Starting full analysis of {len(tickers)} tickers...")
 
     # Fetch real prices + OHLCV for all tickers up front (one batch call each)

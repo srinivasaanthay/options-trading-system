@@ -271,3 +271,140 @@ def test_compute_consistent_tickers_ranks_by_appearance_count(monkeypatch):
 def test_compute_consistent_tickers_empty_when_no_snapshots(monkeypatch):
     monkeypatch.setattr(app_module, "hourly_snapshots", [])
     assert _compute_consistent_tickers() == []
+
+
+# ── Broad market news (mcp_stock_agent.MCPStockAgent) ──────────────────────
+# Replaced ~1,650 per-ticker Alpaca news calls with one market-wide pull;
+# Alpaca tags each article with the tickers it covers, so that single batch
+# doubles as both the sentiment source and the "breaking news" discovery
+# feed. See _fetch_broad_market_news / get_news_matched_tickers.
+
+@pytest.fixture
+def agent():
+    from mcp_stock_agent import MCPStockAgent
+    return MCPStockAgent()
+
+
+class _FakeArticle:
+    def __init__(self, headline, symbols):
+        self.headline = headline
+        self.symbols = symbols
+
+
+class _FakeNewsResponse:
+    def __init__(self, articles):
+        self.data = {'news': articles}
+
+
+def _patch_alpaca_news(monkeypatch, articles):
+    import alpaca.data.historical.news as news_module
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def get_news(self, req):
+            return _FakeNewsResponse(articles)
+
+    monkeypatch.setattr(news_module, "NewsClient", _FakeClient)
+
+
+def test_score_headlines_none_when_no_keywords_match(agent):
+    assert agent._score_headlines(["Some headline with no tracked words"]) is None
+
+
+def test_score_headlines_bullish_beats_bearish_net_positive(agent):
+    result = agent._score_headlines(["Company beats estimates and raises guidance"])
+    assert result is not None
+    assert result['overall_sentiment'] > 0
+    assert result['trend'] == 'improving'
+
+
+def test_score_headlines_skips_market_wide_openers(agent):
+    # "Stocks... higher" opens with a MARKET_OPENERS word — shouldn't count
+    # toward any single ticker's sentiment even though "higher" isn't tracked
+    # anyway; this checks the opener-skip path itself using a tracked word.
+    result = agent._score_headlines(["Stocks surge as investors cheer earnings"])
+    assert result is None  # "surge" only appears in a skipped opener headline
+
+
+def test_fetch_broad_market_news_groups_by_tagged_symbol(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company beats estimates, shares soar", ["NVDA"]),
+        _FakeArticle("Firm cuts guidance after weak quarter, layoffs planned", ["MSTR"]),
+        _FakeArticle("Nothing notable happened today", ["ZZZZ"]),  # no keyword hit
+    ])
+    result = agent._fetch_broad_market_news()
+    assert result["NVDA"]["overall_sentiment"] > 0
+    assert result["MSTR"]["overall_sentiment"] < 0
+    assert "ZZZZ" not in result  # no signal after scoring -> excluded, not zero
+
+
+def test_fetch_broad_market_news_multi_symbol_article_scores_all_tagged_tickers(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Sector rallies as both firms beat expectations", ["AAPL", "MSFT"]),
+    ])
+    result = agent._fetch_broad_market_news()
+    assert "AAPL" in result and "MSFT" in result
+
+
+def test_fetch_broad_market_news_caches_for_30_minutes(agent, monkeypatch):
+    calls = {"n": 0}
+    import alpaca.data.historical.news as news_module
+
+    class _CountingClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def get_news(self, req):
+            calls["n"] += 1
+            return _FakeNewsResponse([_FakeArticle("Company beats estimates", ["NVDA"])])
+
+    monkeypatch.setattr(news_module, "NewsClient", _CountingClient)
+    agent._fetch_broad_market_news()
+    agent._fetch_broad_market_news()
+    assert calls["n"] == 1  # second call served from cache
+
+
+def test_get_news_matched_tickers_returns_symbol_set(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company beats estimates", ["NVDA"]),
+    ])
+    assert agent.get_news_matched_tickers() == {"NVDA"}
+
+
+def test_fetch_real_news_data_returns_real_sentiment_for_matched_ticker(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company beats estimates and raises guidance", ["NVDA"]),
+    ])
+    result = agent._fetch_real_news_data("NVDA")
+    assert result['overall_sentiment'] > 0
+    assert result['news_count'] == 1
+
+
+def test_fetch_real_news_data_neutral_when_ticker_not_in_broad_feed(agent, monkeypatch):
+    # The overwhelming common case: a ticker not among the ~50 top market
+    # headlines this cycle. Must be neutral (0.5 normalized), not a
+    # price-momentum proxy that would double-count the technical/strategy
+    # weights already derived from the same price action.
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company beats estimates", ["NVDA"]),
+    ])
+    result = agent._fetch_real_news_data("SOME_UNRELATED_TICKER")
+    assert result['overall_sentiment'] == 0.0
+    assert result['news_count'] == 0
+
+
+def test_fetch_real_news_data_neutral_on_api_failure_with_no_prior_cache(agent, monkeypatch):
+    import alpaca.data.historical.news as news_module
+
+    class _BrokenClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def get_news(self, req):
+            raise RuntimeError("Alpaca unavailable")
+
+    monkeypatch.setattr(news_module, "NewsClient", _BrokenClient)
+    result = agent._fetch_real_news_data("AAPL")
+    assert result['overall_sentiment'] == 0.0
