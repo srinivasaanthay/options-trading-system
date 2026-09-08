@@ -1945,6 +1945,26 @@ async def get_sp500_history(
     }
 
 
+@app.get("/api/v1/market-news")
+async def get_market_news(
+    limit: int = 10,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Top market-wide headlines for the app's scrolling news banner.
+    Served straight from the same 30-min broad-news cache the sentiment
+    scoring already uses — no extra Alpaca calls beyond what's already
+    happening every scan cycle."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    loop = asyncio.get_event_loop()
+    headlines = await loop.run_in_executor(None, stock_agent.get_top_headlines, limit)
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        "count": len(headlines),
+        "headlines": headlines,
+    }
+
+
 def _compute_consistent_tickers() -> List[Dict]:
     """Rank tickers by how many of today's hourly snapshots they appeared in
     — built from the same hourly_snapshots already collected for /history.

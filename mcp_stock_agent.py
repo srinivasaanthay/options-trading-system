@@ -217,7 +217,7 @@ class MCPStockAgent:
         self._market_cache: Dict = {}
         self._market_cache_time: Optional[datetime] = None
         self._options_cache: Dict[str, Tuple[Dict, datetime]] = {}
-        self._broad_news_cache: Optional[Tuple[Dict[str, Dict], datetime]] = None
+        self._broad_news_cache: Optional[Tuple[List[Dict], datetime]] = None
         self._earnings_cache: Dict[str, Tuple[int, datetime]] = {}    # ticker → (days_to_earn, fetched_at)
         self._fundamental_cache: Dict[str, Tuple[Dict, datetime]] = {} # ticker → (data, fetched_at)
 
@@ -932,47 +932,55 @@ class MCPStockAgent:
             'news_count': len(headlines),
         }
 
-    def _fetch_broad_market_news(self) -> Dict[str, Dict]:
+    def _fetch_broad_articles(self) -> List[Dict]:
         """One market-wide news pull (no symbol filter) instead of ~1,650
-        per-ticker calls — Alpaca tags each article with the tickers it's
-        about, so this doubles as the ticker->sentiment map and the
-        discovery feed (see get_news_matched_tickers). Cached 30 min:
-        market-wide headlines don't turn over meaningfully faster than that."""
+        per-ticker calls, cached 30 min — market-wide headlines don't turn
+        over meaningfully faster than that. Returns raw articles
+        (most-recent-first, as Alpaca returns them) shared by both the
+        per-ticker sentiment map (_fetch_broad_market_news) and the
+        top-headlines banner feed (get_top_headlines)."""
         now = datetime.utcnow()
         if self._broad_news_cache:
             cached, fetched_at = self._broad_news_cache
             if (now - fetched_at).total_seconds() < 1800:
                 return cached
 
-        result: Dict[str, Dict] = {}
+        articles: List[Dict] = []
         try:
             from alpaca.data.historical.news import NewsClient
             from alpaca.data.requests import NewsRequest
             client = NewsClient(os.environ.get('ALPACA_API_KEY', ''), os.environ.get('ALPACA_API_SECRET', ''))
             req = NewsRequest(limit=50)  # no symbols= -> top market-wide news
-            articles = client.get_news(req).data.get('news', [])
-
-            headlines_by_ticker: Dict[str, List[str]] = {}
-            for article in articles:
+            raw_articles = client.get_news(req).data.get('news', [])
+            for article in raw_articles:
                 title = article.headline or ''
                 if not title:
                     continue
-                for sym in (article.symbols or []):
-                    headlines_by_ticker.setdefault(sym, []).append(title)
-
-            for ticker, headlines in headlines_by_ticker.items():
-                scored = self._score_headlines(headlines)
-                if scored is not None:
-                    result[ticker] = scored
+                articles.append({'headline': title, 'symbols': list(article.symbols or [])})
 
         except Exception:
             logger.warning("Broad market news fetch failed", exc_info=True)
             # Keep the previous cache (if any) rather than wiping it out on a
-            # transient API failure — a stale-but-real map beats an empty one.
+            # transient API failure — stale-but-real articles beat none.
             if self._broad_news_cache:
                 return self._broad_news_cache[0]
 
-        self._broad_news_cache = (result, now)
+        self._broad_news_cache = (articles, now)
+        return articles
+
+    def _fetch_broad_market_news(self) -> Dict[str, Dict]:
+        """Per-ticker sentiment map derived from the shared broad-article
+        cache — doubles as the discovery feed (see get_news_matched_tickers)."""
+        headlines_by_ticker: Dict[str, List[str]] = {}
+        for article in self._fetch_broad_articles():
+            for sym in article['symbols']:
+                headlines_by_ticker.setdefault(sym, []).append(article['headline'])
+
+        result: Dict[str, Dict] = {}
+        for ticker, headlines in headlines_by_ticker.items():
+            scored = self._score_headlines(headlines)
+            if scored is not None:
+                result[ticker] = scored
         return result
 
     def get_news_matched_tickers(self) -> Set[str]:
@@ -980,6 +988,25 @@ class MCPStockAgent:
         breaking-news tickers into the scan even if they didn't clear the
         normal quality filter yet."""
         return set(self._fetch_broad_market_news().keys())
+
+    def get_top_headlines(self, limit: int = 10) -> List[Dict]:
+        """Top market headlines for the UI ticker banner — most recent
+        first, deduplicated by headline text (the same story often gets
+        tagged to multiple tickers as separate article entries)."""
+        seen = set()
+        out: List[Dict] = []
+        for article in self._fetch_broad_articles():
+            headline = article['headline']
+            if headline in seen:
+                continue
+            seen.add(headline)
+            out.append({
+                'headline': headline,
+                'tickers': article['symbols'][:3],  # cap display tags
+            })
+            if len(out) >= limit:
+                break
+        return out
 
     def _fetch_real_news_data(self, ticker: str) -> Dict:
         """Sentiment for one ticker, sourced from the shared broad market-news

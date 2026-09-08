@@ -408,3 +408,39 @@ def test_fetch_real_news_data_neutral_on_api_failure_with_no_prior_cache(agent, 
     monkeypatch.setattr(news_module, "NewsClient", _BrokenClient)
     result = agent._fetch_real_news_data("AAPL")
     assert result['overall_sentiment'] == 0.0
+
+
+def test_get_top_headlines_returns_most_recent_first_with_tickers(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company beats estimates", ["NVDA"]),
+        _FakeArticle("Firm cuts guidance after weak quarter", ["MSTR"]),
+    ])
+    headlines = agent.get_top_headlines(limit=10)
+    assert headlines[0] == {'headline': "Company beats estimates", 'tickers': ["NVDA"]}
+    assert headlines[1] == {'headline': "Firm cuts guidance after weak quarter", 'tickers': ["MSTR"]}
+
+
+def test_get_top_headlines_respects_limit(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle(f"Headline number {i}", ["AAPL"]) for i in range(20)
+    ])
+    assert len(agent.get_top_headlines(limit=5)) == 5
+
+
+def test_get_top_headlines_dedupes_same_story_tagged_to_multiple_tickers(agent, monkeypatch):
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Sector rallies on trade news", ["AAPL"]),
+        _FakeArticle("Sector rallies on trade news", ["MSFT"]),
+    ])
+    headlines = agent.get_top_headlines(limit=10)
+    assert len(headlines) == 1
+
+
+def test_get_top_headlines_includes_headlines_with_no_scored_sentiment(agent, monkeypatch):
+    # A headline with no tracked keyword still belongs on a banner (it's
+    # real news) even though it contributes nothing to the sentiment score.
+    _patch_alpaca_news(monkeypatch, [
+        _FakeArticle("Company announces new product lineup", ["AAPL"]),
+    ])
+    headlines = agent.get_top_headlines(limit=10)
+    assert len(headlines) == 1
