@@ -1965,6 +1965,23 @@ async def get_market_news(
     }
 
 
+@app.get("/api/v1/market-pulse")
+async def get_market_pulse_endpoint(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """SPY day-change + VIX snapshot for the dashboard banner's fixed
+    leading chip — same 30-min-cached SPY/VIX fetch the market_score
+    composite weight already uses, reshaped for display."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    loop = asyncio.get_event_loop()
+    pulse = await loop.run_in_executor(None, stock_agent.get_market_pulse)
+    return {
+        "timestamp": datetime.utcnow().isoformat(),
+        **pulse,
+    }
+
+
 def _compute_consistent_tickers() -> List[Dict]:
     """Rank tickers by how many of today's hourly snapshots they appeared in
     — built from the same hourly_snapshots already collected for /history.

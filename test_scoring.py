@@ -444,3 +444,57 @@ def test_get_top_headlines_includes_headlines_with_no_scored_sentiment(agent, mo
     ])
     headlines = agent.get_top_headlines(limit=10)
     assert len(headlines) == 1
+
+
+# ── Market pulse (banner's fixed SPY/VIX chip) ──────────────────────────────
+
+def _patch_market_data(agent, monkeypatch, **overrides):
+    data = {
+        'spy_change_pct': 0.0,
+        'vix': 20.0,
+        'volatility': {'regime': 'medium'},
+    }
+    data.update(overrides)
+    monkeypatch.setattr(agent, "_fetch_real_market_data", lambda: data)
+
+
+def test_market_pulse_quiet_session_when_flat_and_low_vix(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.05,
+                        vix=13.0, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['summary'] == 'Quiet session'
+
+
+def test_market_pulse_rallying_on_strong_positive_change(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=1.2,
+                        vix=14.0, volatility={'regime': 'low'})
+    assert agent.get_market_pulse()['summary'] == 'Rallying'
+
+
+def test_market_pulse_selling_off_on_strong_negative_change(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=-0.8,
+                        vix=18.0, volatility={'regime': 'medium'})
+    assert agent.get_market_pulse()['summary'] == 'Selling off'
+
+
+def test_market_pulse_volatile_takes_priority_over_direction(agent, monkeypatch):
+    # High VIX should read as "Volatile" even on a day SPY is up strongly —
+    # the fear gauge matters more here than which way price moved.
+    _patch_market_data(agent, monkeypatch, spy_change_pct=1.5,
+                        vix=32.0, volatility={'regime': 'high'})
+    assert agent.get_market_pulse()['summary'] == 'Volatile'
+
+
+def test_market_pulse_mixed_when_neither_quiet_nor_directional(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.4,
+                        vix=19.0, volatility={'regime': 'medium'})
+    assert agent.get_market_pulse()['summary'] == 'Mixed'
+
+
+def test_market_pulse_passes_through_spy_change_and_vix(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=-0.55,
+                        vix=15.72, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['spy_change_pct'] == -0.55
+    assert pulse['vix'] == 15.72
+    assert pulse['vix_regime'] == 'low'

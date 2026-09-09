@@ -1041,6 +1041,7 @@ class MCPStockAgent:
             spy = raw['Close']['SPY'].dropna()
             vix_s = raw['Close']['^VIX'].dropna()
             spy_price = float(spy.iloc[-1])
+            spy_prev_close = float(spy.iloc[-2]) if len(spy) > 1 else spy_price
             spy_sma50 = float(spy.rolling(50).mean().iloc[-1])
             spy_sma200 = float(spy.rolling(200).mean().iloc[-1])
             vix = float(vix_s.iloc[-1])
@@ -1058,6 +1059,7 @@ class MCPStockAgent:
 
             result = {
                 'spy_price': spy_price,
+                'spy_change_pct': round((spy_price - spy_prev_close) / spy_prev_close * 100, 2) if spy_prev_close else 0.0,
                 'spy_sma50': spy_sma50,
                 'spy_sma200': spy_sma200,
                 'vix': vix,
@@ -1073,6 +1075,33 @@ class MCPStockAgent:
         except Exception as e:
             logger.error(f"[Market] fetch failed: {e}")
             return self._generate_market_data()
+
+    def get_market_pulse(self) -> Dict:
+        """Compact SPY/VIX snapshot for the dashboard banner — the same
+        30-min-cached fetch that already feeds the market_score composite
+        weight, just reshaped for display instead of scoring."""
+        data = self._fetch_real_market_data()
+        change = data.get('spy_change_pct', 0.0)
+        vix = data.get('vix', 20.0)
+        regime = data.get('volatility', {}).get('regime', 'medium')
+
+        if regime in ('high', 'extreme'):
+            summary = 'Volatile'
+        elif change >= 0.5:
+            summary = 'Rallying'
+        elif change <= -0.5:
+            summary = 'Selling off'
+        elif abs(change) < 0.3 and regime == 'low':
+            summary = 'Quiet session'
+        else:
+            summary = 'Mixed'
+
+        return {
+            'spy_change_pct': change,
+            'vix': round(vix, 2),
+            'vix_regime': regime,
+            'summary': summary,
+        }
 
     def _fetch_real_options_data(self, ticker: str, price: float) -> Dict:
         """Fetch real options chain: IV per strike, put/call ratio, ATM recommendations."""
@@ -1281,6 +1310,7 @@ class MCPStockAgent:
         """Fallback: neutral market data"""
         return {
             'spy_price': 500.0,
+            'spy_change_pct': 0.0,
             'spy_sma50': 490.0,
             'spy_sma200': 470.0,
             'vix': 20.0,
