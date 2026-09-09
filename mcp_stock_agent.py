@@ -1036,12 +1036,15 @@ class MCPStockAgent:
             return self._market_cache
         try:
             import yfinance as yf
-            raw = yf.download(['SPY', '^VIX'], period='1y', interval='1d',
+            raw = yf.download(['SPY', 'IWM', '^VIX'], period='1y', interval='1d',
                               progress=False, auto_adjust=True)
             spy = raw['Close']['SPY'].dropna()
+            iwm = raw['Close']['IWM'].dropna()
             vix_s = raw['Close']['^VIX'].dropna()
             spy_price = float(spy.iloc[-1])
             spy_prev_close = float(spy.iloc[-2]) if len(spy) > 1 else spy_price
+            iwm_price = float(iwm.iloc[-1])
+            iwm_prev_close = float(iwm.iloc[-2]) if len(iwm) > 1 else iwm_price
             spy_sma50 = float(spy.rolling(50).mean().iloc[-1])
             spy_sma200 = float(spy.rolling(200).mean().iloc[-1])
             vix = float(vix_s.iloc[-1])
@@ -1060,6 +1063,7 @@ class MCPStockAgent:
             result = {
                 'spy_price': spy_price,
                 'spy_change_pct': round((spy_price - spy_prev_close) / spy_prev_close * 100, 2) if spy_prev_close else 0.0,
+                'iwm_change_pct': round((iwm_price - iwm_prev_close) / iwm_prev_close * 100, 2) if iwm_prev_close else 0.0,
                 'spy_sma50': spy_sma50,
                 'spy_sma200': spy_sma200,
                 'vix': vix,
@@ -1077,13 +1081,32 @@ class MCPStockAgent:
             return self._generate_market_data()
 
     def get_market_pulse(self) -> Dict:
-        """Compact SPY/VIX snapshot for the dashboard banner — the same
+        """Compact SPY/VIX/IWM snapshot for the dashboard banner — the same
         30-min-cached fetch that already feeds the market_score composite
-        weight, just reshaped for display instead of scoring."""
+        weight, just reshaped for display instead of scoring.
+
+        trade_advisory is the actionable verdict (Favorable/Caution/
+        Unfavorable) the banner surfaces as its primary signal — built from
+        two real risk indicators, not price direction alone: VIX regime
+        (real fear/options-pricing risk) and the SPY-vs-IWM divergence
+        (small caps underperforming large caps signals risk-off rotation
+        and rising correlation, both of which make individual per-ticker
+        technical signals less trustworthy even on a calm-looking index
+        day — this is exactly the pattern found investigating 2026-09-09,
+        where SPY was only -0.47% but IWM was -1.35%)."""
         data = self._fetch_real_market_data()
         change = data.get('spy_change_pct', 0.0)
+        iwm_change = data.get('iwm_change_pct', 0.0)
         vix = data.get('vix', 20.0)
         regime = data.get('volatility', {}).get('regime', 'medium')
+        divergence = round(change - iwm_change, 2)  # positive = small caps lagging
+
+        if regime in ('high', 'extreme') or abs(divergence) >= 2.0:
+            advisory = 'Unfavorable'
+        elif regime == 'medium' or abs(divergence) >= 1.0:
+            advisory = 'Caution'
+        else:
+            advisory = 'Favorable'
 
         if regime in ('high', 'extreme'):
             summary = 'Volatile'
@@ -1098,8 +1121,11 @@ class MCPStockAgent:
 
         return {
             'spy_change_pct': change,
+            'iwm_change_pct': iwm_change,
+            'divergence_pct': divergence,
             'vix': round(vix, 2),
             'vix_regime': regime,
+            'trade_advisory': advisory,
             'summary': summary,
         }
 
@@ -1311,6 +1337,7 @@ class MCPStockAgent:
         return {
             'spy_price': 500.0,
             'spy_change_pct': 0.0,
+            'iwm_change_pct': 0.0,
             'spy_sma50': 490.0,
             'spy_sma200': 470.0,
             'vix': 20.0,

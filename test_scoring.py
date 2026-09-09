@@ -451,6 +451,7 @@ def test_get_top_headlines_includes_headlines_with_no_scored_sentiment(agent, mo
 def _patch_market_data(agent, monkeypatch, **overrides):
     data = {
         'spy_change_pct': 0.0,
+        'iwm_change_pct': 0.0,
         'vix': 20.0,
         'volatility': {'regime': 'medium'},
     }
@@ -498,3 +499,68 @@ def test_market_pulse_passes_through_spy_change_and_vix(agent, monkeypatch):
     assert pulse['spy_change_pct'] == -0.55
     assert pulse['vix'] == 15.72
     assert pulse['vix_regime'] == 'low'
+
+
+# ── Trade advisory (Favorable/Caution/Unfavorable verdict) ────────────────
+# Built from two real risk signals, not price direction alone: VIX regime
+# and the SPY-vs-IWM divergence (small caps lagging large caps signals
+# risk-off rotation/rising correlation even on a calm-looking index day —
+# the exact pattern found on 2026-09-09: SPY -0.47%, IWM -1.35%).
+
+def test_trade_advisory_favorable_when_calm_and_no_divergence(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.1, iwm_change_pct=0.15,
+                        vix=14.0, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['trade_advisory'] == 'Favorable'
+    assert pulse['divergence_pct'] == pytest.approx(-0.05, abs=0.01)
+
+
+def test_trade_advisory_unfavorable_on_high_vix_even_if_indexes_calm(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.1, iwm_change_pct=0.1,
+                        vix=32.0, volatility={'regime': 'high'})
+    assert agent.get_market_pulse()['trade_advisory'] == 'Unfavorable'
+
+
+def test_trade_advisory_unfavorable_on_large_small_cap_divergence(agent, monkeypatch):
+    # A >=2.0pp divergence alone (independent of VIX) should trip
+    # Unfavorable — the real 2026-09-09 case (SPY -0.47%, IWM -1.35%, a
+    # 0.88pp divergence) only reached Caution; this checks the wider
+    # Unfavorable threshold itself.
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.2, iwm_change_pct=-2.0,
+                        vix=16.0, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['divergence_pct'] == pytest.approx(2.2, abs=0.01)
+    assert pulse['trade_advisory'] == 'Unfavorable'
+
+
+def test_trade_advisory_caution_on_medium_vix_alone(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=0.1, iwm_change_pct=0.1,
+                        vix=20.0, volatility={'regime': 'medium'})
+    assert agent.get_market_pulse()['trade_advisory'] == 'Caution'
+
+
+def test_trade_advisory_favorable_on_mild_divergence_within_normal_beta_noise(agent, monkeypatch):
+    # The real 2026-09-09 case: SPY -0.47%, IWM -1.35%, a 0.88pp divergence.
+    # Small caps structurally run higher-beta than SPY, so under ~1pp of
+    # daily divergence is ordinary noise, not a real risk-off signal — this
+    # should stay Favorable, not trip Caution on every slightly-red day.
+    _patch_market_data(agent, monkeypatch, spy_change_pct=-0.47, iwm_change_pct=-1.35,
+                        vix=16.46, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['divergence_pct'] == pytest.approx(0.88, abs=0.01)
+    assert pulse['trade_advisory'] == 'Favorable'
+
+
+def test_trade_advisory_caution_on_moderate_divergence_alone(agent, monkeypatch):
+    _patch_market_data(agent, monkeypatch, spy_change_pct=-0.3, iwm_change_pct=-1.4,
+                        vix=16.0, volatility={'regime': 'low'})
+    pulse = agent.get_market_pulse()
+    assert pulse['divergence_pct'] == pytest.approx(1.1, abs=0.01)
+    assert pulse['trade_advisory'] == 'Caution'
+
+
+def test_trade_advisory_divergence_sign_reflects_small_caps_lagging(agent, monkeypatch):
+    # Positive divergence = SPY outperforming IWM = small caps lagging.
+    _patch_market_data(agent, monkeypatch, spy_change_pct=1.0, iwm_change_pct=-1.0,
+                        vix=14.0, volatility={'regime': 'low'})
+    assert agent.get_market_pulse()['divergence_pct'] == pytest.approx(2.0, abs=0.01)
