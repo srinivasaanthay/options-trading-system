@@ -59,6 +59,7 @@ from mcp_stock_agent import MCPStockAgent, BuySignal, ConfidenceLevel
 from notification_manager import NotificationManager
 from paper_trading_service import PaperTradingService
 from stock_trading_service import StockTradingService
+import dynamic_tickers
 
 logger = logging.getLogger(__name__)
 
@@ -92,64 +93,6 @@ def _is_market_open() -> bool:
     market_open  = now_et.replace(hour=10, minute=0,  second=0, microsecond=0)
     market_close = now_et.replace(hour=15, minute=30, second=0, microsecond=0)
     return market_open <= now_et < market_close
-
-# ============================================================================
-# SP500 TICKERS - Real S&P 500 companies
-# ============================================================================
-
-SP500_TICKERS = [
-    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK.B', 'JPM', 'V',
-    'UNH', 'XOM', 'JNJ', 'WMT', 'MA', 'PG', 'LLY', 'HD', 'CVX', 'MRK',
-    'ABBV', 'PEP', 'KO', 'COST', 'AVGO', 'BAC', 'TMO', 'ACN', 'MCD', 'CSCO',
-    'ABT', 'CRM', 'ADBE', 'DHR', 'LIN', 'NEE', 'TXN', 'PM', 'NKE', 'DIS',
-    'VZ', 'ORCL', 'CMCSA', 'RTX', 'T', 'BMY', 'INTC', 'AMD', 'AMGN', 'HON',
-    'UPS', 'QCOM', 'COP', 'SBUX', 'INTU', 'IBM', 'CAT', 'DE', 'GS', 'AXP',
-    'BKNG', 'SPGI', 'BA', 'BLK', 'MS', 'GILD', 'C', 'LMT', 'MDT', 'ADP',
-    'SYK', 'AMAT', 'MDLZ', 'ADI', 'PLD', 'TJX', 'ISRG', 'CI', 'REGN', 'VRTX',
-    'MMC', 'ZTS', 'PANW', 'SLB', 'BSX', 'NOW', 'MO', 'LRCX', 'EOG', 'KLAC',
-    'HCA', 'ITW', 'ETN', 'AON', 'APD', 'MAR', 'MCO', 'TGT', 'USB', 'WFC',
-    'GE', 'PNC', 'SNPS', 'CDNS', 'FDX', 'DUK', 'SO', 'ICE', 'MU', 'CL',
-    'FCX', 'CSX', 'NSC', 'EMR', 'HUM', 'CTAS', 'PYPL', 'WM', 'CME', 'EQIX',
-    'MNST', 'ORLY', 'MCHP', 'WELL', 'PCAR', 'FTNT', 'MSI', 'APH', 'GD', 'ROP',
-    'IDXX', 'EW', 'DXCM', 'ODFL', 'CPRT', 'ROST', 'AZO', 'PAYX', 'VRSK', 'NDAQ',
-    'FAST', 'BIIB', 'CTVA', 'CEG', 'CCI', 'CARR', 'AMT', 'TT', 'GLW', 'DLTR',
-    'ON', 'A', 'PWR', 'IQV', 'FANG', 'GEHC', 'KEYS', 'WAB', 'TROW', 'ELV',
-    'MTD', 'LVS', 'CSGP', 'ACGL', 'ENPH', 'SEDG', 'ALGN', 'TSCO', 'POOL', 'ULTA',
-    'NUE', 'CF', 'MOS', 'IP', 'PKG', 'AVY', 'SEE', 'SON', 'CCK', 'BALL',
-    'LHX', 'TDG', 'TDY', 'HEI', 'HWM', 'SPR', 'WWD', 'AXON', 'MOOG', 'DRS',
-    'LDOS', 'SAIC', 'BAH', 'CACI', 'MRNA', 'ILMN', 'IEX', 'PODD', 'HOLX', 'BAX',
-    'RMD', 'STE', 'COO', 'NVCR', 'INSP', 'SWAV', 'NTRA', 'IRTC', 'TMDX', 'RXRX',
-    'PCVX', 'ARWR', 'ALNY', 'BMRN', 'RARE', 'PTCT', 'FOLD', 'SRPT', 'IONS', 'BLUE',
-    'JPM', 'BAC', 'WFC', 'C', 'GS', 'MS', 'USB', 'PNC', 'TFC', 'COF',
-    'AXP', 'DFS', 'SYF', 'AIG', 'MET', 'PRU', 'AFL', 'ALL', 'CB', 'HIG',
-    'LNC', 'UNM', 'GL', 'FNF', 'FAF', 'CINF', 'ERIE', 'WR', 'HCI', 'KMPR',
-    'AMZN', 'EBAY', 'ETSY', 'W', 'CHWY', 'PTON', 'NFLX', 'ROKU', 'FUBO', 'PARA',
-    'VIAC', 'FOX', 'FOXA', 'NYT', 'SSP', 'GCI', 'LEA', 'MHK', 'TPX', 'SNBR',
-    'WSM', 'RH', 'TGT', 'KSS', 'M', 'JWN', 'DDS', 'BKE', 'CATO',
-    'CROX', 'SKX', 'NKE', 'COLM', 'VFC', 'PVH', 'HBI', 'RL', 'UAA', 'GOOS',
-    'GPS', 'ANF', 'AEO', 'URBN', 'CRI', 'BURL', 'FIVE', 'OLLI', 'BIG', 'BGFV',
-    'CAL', 'RCII', 'PRTS', 'AAP', 'ORLY', 'AZO', 'GPC', 'LKQ', 'BWA', 'APTV',
-    'LEA', 'MGA', 'ALV', 'DORM', 'THRM', 'MODG', 'F', 'GM', 'STLA', 'TM',
-    'HMC', 'NSANY', 'VWAGY', 'BMWYY', 'DDAIF', 'TSLA', 'RIVN', 'LCID', 'FSR', 'NIO',
-    'XPEV', 'LI', 'PDD', 'JD', 'BABA', 'BIDU', 'TCOM', 'IQ', 'VNET', 'CAN',
-    'TSM', 'ASML', 'LRCX', 'AMAT', 'KLAC', 'TER', 'ONTO', 'COHU', 'ACLS', 'FORM',
-    'IPGP', 'IIVI', 'IPAR', 'OLED', 'AEIS', 'AXTI', 'ENTG', 'MKSI', 'AZTA', 'UCTT',
-    'CRUS', 'SLAB', 'ALGM', 'DIOD', 'VICR', 'IXYS', 'POWI', 'AEHR', 'MPWR', 'MTSI',
-    'RMBS', 'SMTC', 'SWKS', 'QRVO', 'SIMO', 'NXPI', 'MXIM', 'ADI', 'TXN', 'MCHP',
-    'BRKS', 'CCMP', 'CEVA', 'CMTL', 'CNXN', 'COHU', 'COPY', 'CREE', 'CY', 'DSPG',
-    'EMKR', 'ERIC', 'ESIO', 'FARO', 'FORM', 'FN', 'GNSS', 'GRMN', 'HOLI', 'ICHR',
-    'IDTI', 'IIVI', 'IMOS', 'INPHI', 'IPHI', 'ISSI', 'IXYS', 'JNPR', 'KTCC', 'LSCC',
-    'LLTC', 'MACOM', 'MFIN', 'MRAM', 'MRVL', 'MTSC', 'MU', 'MXIM', 'NANO', 'NATI',
-    'NOVT', 'NSR', 'NTGR', 'ONTO', 'OIIM', 'ORCL', 'PBYI', 'PDFS', 'PLAB', 'PLT',
-    'PMCS', 'PSEM', 'PTEC', 'PVTL', 'QCOM', 'RDWR', 'RFMD', 'RMBS', 'RNST', 'RPXC',
-    'RSYS', 'RTEC', 'SCON', 'SLAB', 'SMSC', 'SMTC', 'SNPS', 'SPIL', 'SPY', 'SSNI',
-    'SSTI', 'SWIR', 'SYNA', 'SYMC', 'TQNT', 'TRMB', 'TTMI', 'UEIC', 'ULTI', 'UTSI',
-    'VIAV', 'VICR', 'VRNT', 'VSAT', 'XLNX', 'XRAY', 'ZDGE', 'ZIGO',
-]
-
-# Deduplicate while preserving order
-seen = set()
-SP500_TICKERS = [t for t in SP500_TICKERS if not (t in seen or seen.add(t))]
 
 
 # ============================================================================
@@ -1451,7 +1394,12 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     loop = asyncio.get_event_loop()
     tickers = await loop.run_in_executor(None, get_dynamic_tickers)
     if not tickers:
-        tickers = SP500_TICKERS  # fallback to static list
+        # No static-list fallback — a stale, hand-curated ticker list (dead
+        # tickers, non-S&P-500 names mixed in) would silently mislead rather
+        # than help. Skip this cycle and keep the last good recommendations;
+        # the next cycle retries the real dynamic fetch.
+        logger.error("[SP500] Dynamic ticker universe fetch returned 0 tickers — skipping this scan cycle")
+        return latest_options_recs
 
     # Discovery: pull in tickers making breaking news that haven't cleared
     # the normal market-cap/price/volume quality filter yet. They still go
@@ -1882,7 +1830,10 @@ async def system_status(credentials: HTTPAuthorizationCredentials = Depends(secu
         "sp500": {
             "last_run": last_sp500_run.isoformat() if last_sp500_run else None,
             "recommendations_available": len(latest_options_recs),
-            "ticker_count": len(SP500_TICKERS),
+            # Reads today's cached dynamic universe without forcing a fresh
+            # screener fetch inside a status endpoint — 0 just means it
+            # hasn't run yet today, not that the universe is empty.
+            "ticker_count": len(dynamic_tickers._cached_tickers),
         },
         "active_websocket_connections": len(active_connections) + len(agent_connections) + len(options_ws_connections),
     }
@@ -2173,8 +2124,9 @@ async def trigger_sp500_analysis(
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
     # Run a quick sample of 20 tickers immediately (full run is in background)
-    sample = SP500_TICKERS[:20]
     loop = asyncio.get_event_loop()
+    all_tickers = await loop.run_in_executor(None, dynamic_tickers.get_dynamic_tickers)
+    sample = all_tickers[:20]
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, sample)
     await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, sample)
     recs = []
