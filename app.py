@@ -134,6 +134,16 @@ class OptionsRecommendation:
     avg_dollar_volume: float = 0.0     # 20d avg shares x price — absolute liquidity/"how fast
                                         # does this normally move" measure, not self-relative
                                         # like volume_ratio
+    # Candlestick read on the most recent completed daily bar — see
+    # candle_patterns.py. Informational only, NOT a scoring input (adding
+    # it into the composite score would mean re-weighting and re-validating
+    # the already-calibrated 0.55/0.65/0.70/0.80 confidence thresholds).
+    candle_pattern: str = "No Data"
+    candle_signal: str = "neutral"     # "bullish" | "bearish" | "neutral" — drives the UI's color
+    candle_open: float = 0.0
+    candle_high: float = 0.0
+    candle_low: float = 0.0
+    candle_close: float = 0.0
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -785,6 +795,25 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
+    # Candlestick read — pure computation on the OHLC bars already cached
+    # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
+    # this is free: no extra network call. Deliberately the raw cache dict,
+    # NOT stock_agent._get_ohlcv() — that method's cache-miss fallback makes
+    # a live Alpaca call per ticker, and calling it here (Pass 3 runs
+    # sequentially over every candidate) turned one real scan into ~1500
+    # sequential per-ticker network calls that broke the whole run. A cache
+    # miss here just means "No Data" for that ticker's candle read.
+    from candle_patterns import detect_candle_pattern
+    candle = detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+    # NaN is valid Python/pandas but invalid JSON per Postgres's strict
+    # parser — a NaN here would poison the shared save connection for
+    # every scan after it (see _get_pg_conn's rollback fix). Not observed
+    # in real data during testing, but cheap enough to guard against
+    # regardless of a scoring/display field ever silently becoming NaN.
+    for _k in ("open", "high", "low", "close"):
+        if candle[_k] != candle[_k]:  # NaN != NaN is the classic no-import check
+            candle[_k] = 0.0
+
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
@@ -818,6 +847,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         intraday_move_pct=intraday_move_pct,
         day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
         avg_dollar_volume=round(getattr(analysis_result, 'avg_dollar_volume', 0.0), 0),
+        candle_pattern=candle["pattern"],
+        candle_signal=candle["signal"],
+        candle_open=round(candle["open"], 2),
+        candle_high=round(candle["high"], 2),
+        candle_low=round(candle["low"], 2),
+        candle_close=round(candle["close"], 2),
     )
     # Computed here so every scanned rec carries them (cheap, no network calls)
     # — not just the ones enriched with catalyst data later. See call sites
@@ -1014,7 +1049,18 @@ def _get_pg_conn():
         return None
     try:
         if _pg_conn is not None and not _pg_conn.closed:
-            return _pg_conn
+            # A previous failed write (e.g. bad JSON payload) leaves Postgres
+            # transactions on this connection aborted — without a rollback,
+            # every subsequent query on it fails too, for the rest of the
+            # process's life, not just the one bad write. Rolling back a
+            # connection with no open transaction is a harmless no-op, so
+            # this runs unconditionally rather than trying to detect whether
+            # it's actually needed.
+            try:
+                _pg_conn.rollback()
+                return _pg_conn
+            except Exception:
+                _pg_conn = None  # truly dead (e.g. network drop) — reconnect below
         import psycopg2
         _pg_conn = psycopg2.connect(db_url)
         with _pg_conn.cursor() as cur:
@@ -1057,7 +1103,13 @@ def _save_results_pg():
         return
     try:
         import json as _json
-        payload = _json.dumps([asdict(r) for r in latest_options_recs])
+        # allow_nan=False so a stray NaN/Infinity raises here (caught below,
+        # save just skipped for this cycle) instead of producing JSON text
+        # that Postgres's strict parser rejects at INSERT time — same
+        # failure, but this way it can't leave the shared connection in an
+        # aborted-transaction state first (see _get_pg_conn's rollback fix,
+        # the actual guard against that either way).
+        payload = _json.dumps([asdict(r) for r in latest_options_recs], allow_nan=False)
         last_run_dt = last_sp500_run or datetime.utcnow()
         with conn.cursor() as cur:
             cur.execute("""
