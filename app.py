@@ -936,31 +936,40 @@ def _fetch_ticker_news(ticker: str) -> list:
         return []
 
 
-_SCAN_HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history")
-
-
 def _find_price_near_date(ticker: str, target_date) -> Optional[float]:
-    """Look up ticker's scanned price on/soon after target_date from the local
-    scan_history archive — used to measure how much of a move already
-    happened before today's signal, not just whether the headline is old."""
-    try:
-        import json as _json
-        for offset in range(3):  # target day, then up to 2 days later (weekends/holidays)
-            day_dir = os.path.join(_SCAN_HISTORY_DIR, (target_date + timedelta(days=offset)).strftime("%Y-%m-%d"))
-            if not os.path.isdir(day_dir):
-                continue
-            for fname in sorted(os.listdir(day_dir)):
-                path = os.path.join(day_dir, fname)
-                try:
-                    with open(path) as f:
-                        data = _json.load(f)
-                except Exception:
-                    continue
-                for r in data.get("recommendations", []):
-                    if r.get("ticker") == ticker and r.get("current_price"):
-                        return float(r["current_price"])
+    """Ticker's scanned price on/soon after target_date, from the real
+    Postgres scan_history table (same one GET /sp500/scan-history reads) —
+    used to measure how much of a move already happened before today's
+    signal, not just whether the headline is old. Replaces a local-JSON-
+    file lookup that silently always returned None on Railway (ephemeral
+    filesystem, wiped on every redeploy) — price_change_since_catalyst was
+    always defaulting to 0.0 in production as a result (confirmed
+    2026-09-11 by cross-checking real dated headlines against the field
+    for several tickers).
+
+    Note: scan_history is pruned to the 2 most recent trading dates (see
+    _save_scan_history_pg), so this still can't resolve a catalyst older
+    than that window — it'll cleanly return None (correctly defaulting to
+    0.0) rather than silently claiming data it doesn't have."""
+    conn = _get_pg_conn()
+    if conn is None:
         return None
-    except Exception:
+    try:
+        with conn.cursor() as cur:
+            for offset in range(3):  # target day, then up to 2 days later (weekends/holidays)
+                day = target_date + timedelta(days=offset)
+                cur.execute(
+                    "SELECT current_price FROM scan_history "
+                    "WHERE ticker = %s AND scan_time::date = %s "
+                    "ORDER BY scan_time ASC LIMIT 1",
+                    (ticker, day),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return float(row[0])
+        return None
+    except Exception as e:
+        logger.debug("[CatalystFreshness] %s price lookup failed: %s", ticker, e)
         return None
 
 
@@ -1469,7 +1478,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, prefetch_list)
 
     recs: List[OptionsRecommendation] = []
-    gap_skipped = 0
+    gapped_tickers: set = set()
 
     # Pass 1 — cheap, in-memory filtering only (no network calls), sequential.
     candidates: List[Tuple[str, float]] = []
@@ -1482,19 +1491,25 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
         if not price or price <= 0:
             continue
 
-        # Gap check — catches earnings/news moves the (unreliable, esp.
-        # right around the event) earnings-date lookup below can miss.
-        # COHR's -14% earnings-day drop on 2026-08-13 slipped through
-        # with days_to_earnings misreported as 999; this doesn't depend
-        # on knowing *why* the move happened, just that it already did.
+        # Gap check — used to hard-skip tickers that already moved a lot
+        # since last close (originally to catch earnings/news moves the
+        # unreliable days_to_earnings lookup below can miss, e.g. COHR's
+        # -14% earnings-day drop on 2026-08-13 slipping through with
+        # days_to_earnings misreported as 999). That silently hid the
+        # day's biggest movers entirely — a user asking "why isn't DELL/
+        # HPE on my list" had no way to know they'd gapped past the
+        # threshold and gotten excluded before analysis even ran. Now
+        # still analyzed and shown (still subject to the real
+        # days_to_earnings <= 3 filter below), just flagged via
+        # is_gapped/day_change_pct so the UI can badge it as already
+        # having moved rather than hiding it.
         prev_close = prev_close_map.get(ticker)
         if prev_close and prev_close > 0:
             gap = abs(price - prev_close) / prev_close
             if gap > GAP_RISK_PCT:
-                gap_skipped += 1
-                logger.debug("[SP500] %s skipped — already gapped %.1f%% since last close",
+                gapped_tickers.add(ticker)
+                logger.debug("[SP500] %s already gapped %.1f%% since last close — analyzing anyway",
                              ticker, gap * 100)
-                continue
 
         # Sanity check — a live price must fall within its own day's
         # high/low (already fetched this same scan via the same Alpaca
@@ -1589,7 +1604,7 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     _save_scan_history_pg()  # one row per rec — separate from the single-row latest_scan above
 
     logger.info(f"[SP500] Analysis complete: {len(recs)} signals, top 100 kept"
-                + (f" ({gap_skipped} skipped — already gapped >{GAP_RISK_PCT*100:.0f}%)" if gap_skipped else ""))
+                + (f" ({len(gapped_tickers)} already gapped >{GAP_RISK_PCT*100:.0f}% but still analyzed)" if gapped_tickers else ""))
 
     # Save hourly snapshot — market hours only, reset each trading day
     global hourly_snapshots, _last_snapshot_hour, _last_snapshot_date
