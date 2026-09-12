@@ -797,12 +797,16 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
 
     # Candlestick read — pure computation on the OHLC bars already cached
     # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
-    # this is normally free (no extra network call). _get_ohlcv (not a bare
-    # ._ohlcv_cache.get) matches how analyze_ticker itself reads this data —
-    # it has its own individual-fetch fallback if this ticker's cache entry
-    # is somehow missing at this point in the scan.
+    # this is free: no extra network call. Deliberately the raw cache dict,
+    # NOT stock_agent._get_ohlcv() — that method's cache-miss fallback makes
+    # a live Alpaca call per ticker, and calling it here (Pass 3 runs
+    # sequentially over every candidate) turned one real production scan
+    # into 1552 sequential per-ticker network calls that silently zeroed
+    # out every recommendation (caught by Pass 3's broad except). A cache
+    # miss here just means "No Data" for that one ticker's candle read,
+    # which is an acceptable gap — not worth risking the whole scan for.
     from candle_patterns import detect_candle_pattern
-    candle = detect_candle_pattern(stock_agent._get_ohlcv(ticker) if stock_agent else None)
+    candle = detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
 
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
