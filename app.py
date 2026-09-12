@@ -824,12 +824,18 @@ def _detect_candle_pattern(df) -> Dict:
 
 def _make_options_rec(ticker: str, analysis_result, price: float,
                        today_high: float = None, today_low: float = None,
-                       prev_close: float = None) -> OptionsRecommendation:
+                       prev_close: float = None, precomputed_candle: dict = None) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
     today_high/today_low (optional — from _fetch_intraday_extremes_batch) let a same-day
     reversal dampen the score even though the technical component below is daily-bar-based
     and can't see it on its own. prev_close (optional — from _fetch_prev_closes_batch) is
-    informational only (day_change_pct below) — does not affect score."""
+    informational only (day_change_pct below) — does not affect score. precomputed_candle
+    (optional) skips the live _ohlcv_cache lookup below — the SP500 scan's Pass 1 reads it
+    at the one point already proven to have this ticker's cache entry (right after checking
+    `ticker in stock_agent._ohlcv_cache`), rather than trusting the entry is still there by
+    the time this runs — real production behavior seen: a ticker confirmed present in Pass 1
+    consistently reads back empty here despite nothing in this codebase ever removing cache
+    entries, so this sidesteps that instead of relying on it."""
     is_bearish = (analysis_result.technical_score < 0.48 or
                   analysis_result.buy_signal in [BuySignal.HOLD, BuySignal.AVOID])
     action = "PUT" if is_bearish else "CALL"
@@ -892,15 +898,16 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
-    # Candlestick read — pure computation on the OHLC bars already cached
-    # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
-    # this is free: no extra network call. Deliberately the raw cache dict,
-    # NOT stock_agent._get_ohlcv() — that method's cache-miss fallback makes
-    # a live Alpaca call per ticker, and calling it here (Pass 3 runs
-    # sequentially over every candidate) turned one real scan into ~1500
-    # sequential per-ticker network calls that broke the whole run. A cache
-    # miss here just means "No Data" for that ticker's candle read.
-    candle = _detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+    # Candlestick read — precomputed_candle (see docstring) is preferred;
+    # only fall back to a live cache lookup for call sites that don't pass
+    # it. Deliberately the raw cache dict, NOT stock_agent._get_ohlcv() —
+    # that method's cache-miss fallback makes a live Alpaca call per
+    # ticker, and calling it in a per-ticker loop turned one real scan into
+    # ~1500 sequential network calls that broke the whole run.
+    if precomputed_candle is not None:
+        candle = precomputed_candle
+    else:
+        candle = _detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
     # NaN is valid Python/pandas but invalid JSON per Postgres's strict
     # parser — guarding cheaply against it regardless of a scoring/display
     # field ever silently becoming NaN (not observed in testing).
@@ -1573,10 +1580,18 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
     # Pass 1 — cheap, in-memory filtering only (no network calls), sequential.
     candidates: List[Tuple[str, float]] = []
+    # Candle read computed HERE, not in Pass 3 — this is the one point
+    # already proven to have this ticker's _ohlcv_cache entry (the check
+    # right below). Real production behavior: a ticker confirmed present
+    # here consistently reads back as a cache miss by the time Pass 3 runs,
+    # despite nothing in this codebase ever removing cache entries — rather
+    # than keep chasing that, read it while it's known-good.
+    candles: Dict[str, dict] = {}
     for ticker in tickers:
         # Skip tickers that have no real OHLCV data (delisted / bankrupt)
         if ticker not in stock_agent._ohlcv_cache:
             continue
+        candles[ticker] = _detect_candle_pattern(stock_agent._ohlcv_cache[ticker])
 
         price = price_map.get(ticker) or _fallback_price(ticker)
         if not price or price <= 0:
@@ -1649,7 +1664,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             if is_bullish or is_bearish:
                 t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
                 rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
-                                         prev_close=prev_close_map.get(ticker))
+                                         prev_close=prev_close_map.get(ticker),
+                                         precomputed_candle=candles.get(ticker))
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
