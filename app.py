@@ -134,6 +134,16 @@ class OptionsRecommendation:
     avg_dollar_volume: float = 0.0     # 20d avg shares x price — absolute liquidity/"how fast
                                         # does this normally move" measure, not self-relative
                                         # like volume_ratio
+    # Candlestick read on the most recent completed daily bar — see
+    # candle_patterns.py. Informational only, NOT a scoring input (adding
+    # it into the composite score would mean re-weighting and re-validating
+    # the already-calibrated 0.55/0.65/0.70/0.80 confidence thresholds).
+    candle_pattern: str = "No Data"
+    candle_signal: str = "neutral"     # "bullish" | "bearish" | "neutral" — drives the UI's color
+    candle_open: float = 0.0
+    candle_high: float = 0.0
+    candle_low: float = 0.0
+    candle_close: float = 0.0
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -785,6 +795,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
+    # Candlestick read — pure computation on the OHLC bars already cached
+    # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
+    # this is free: no extra network call.
+    from candle_patterns import detect_candle_pattern
+    candle = detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
@@ -818,6 +834,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         intraday_move_pct=intraday_move_pct,
         day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
         avg_dollar_volume=round(getattr(analysis_result, 'avg_dollar_volume', 0.0), 0),
+        candle_pattern=candle["pattern"],
+        candle_signal=candle["signal"],
+        candle_open=round(candle["open"], 2),
+        candle_high=round(candle["high"], 2),
+        candle_low=round(candle["low"], 2),
+        candle_close=round(candle["close"], 2),
     )
     # Computed here so every scanned rec carries them (cheap, no network calls)
     # — not just the ones enriched with catalyst data later. See call sites
