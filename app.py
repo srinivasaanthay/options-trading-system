@@ -1853,6 +1853,50 @@ async def system_status(credentials: HTTPAuthorizationCredentials = Depends(secu
     }
 
 
+@app.get("/api/v1/debug/candle-test")
+async def debug_candle_test(
+    tickers: str = "AMD,HPE,NOK,MU",
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """DIAGNOSTIC ONLY — isolated, side-effect-free. Runs candle-pattern
+    detection against the REAL production stock_agent._ohlcv_cache for the
+    given tickers and returns the result or the exact exception/traceback,
+    without touching _make_options_rec, OptionsRecommendation, or the scan
+    pipeline in any way. Exists to find why wiring this into the real scan
+    twice caused 0 recommendations on a fresh process, despite the same
+    logic working cleanly against real Alpaca data in offline testing —
+    something only reproduces inside the live process, and this is a
+    zero-risk way to see it directly instead of guessing from another full
+    scan deploy. Remove once that's resolved either way."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    import traceback
+    from candle_patterns import detect_candle_pattern
+
+    results = {}
+    for ticker in [t.strip().upper() for t in tickers.split(",") if t.strip()]:
+        entry = {}
+        try:
+            df = stock_agent._ohlcv_cache.get(ticker) if stock_agent else None
+            entry["cache_hit"] = df is not None
+            if df is not None:
+                entry["rows"] = len(df)
+                entry["dtypes"] = {c: str(t) for c, t in df.dtypes.items()}
+                entry["columns"] = list(df.columns)
+            entry["pattern_result"] = detect_candle_pattern(df)
+        except Exception as e:
+            entry["error"] = str(e)
+            entry["traceback"] = traceback.format_exc()
+        results[ticker] = entry
+
+    return {
+        "stock_agent_initialized": stock_agent is not None,
+        "ohlcv_cache_size": len(stock_agent._ohlcv_cache) if stock_agent else 0,
+        "results": results,
+    }
+
+
 # ============================================================================
 # SP500 OPTIONS RECOMMENDATIONS  ← NEW
 # ============================================================================
