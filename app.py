@@ -134,6 +134,16 @@ class OptionsRecommendation:
     avg_dollar_volume: float = 0.0     # 20d avg shares x price — absolute liquidity/"how fast
                                         # does this normally move" measure, not self-relative
                                         # like volume_ratio
+    # Candlestick read on the most recent completed daily bar — see
+    # _detect_candle_pattern. Informational only, NOT a scoring input
+    # (adding it into the composite score would mean re-weighting and
+    # re-validating the already-calibrated 0.55/0.65/0.70/0.80 thresholds).
+    candle_pattern: str = "No Data"
+    candle_signal: str = "neutral"     # "bullish" | "bearish" | "neutral" — drives the UI's color
+    candle_open: float = 0.0
+    candle_high: float = 0.0
+    candle_low: float = 0.0
+    candle_close: float = 0.0
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -715,6 +725,103 @@ def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[st
     return factors, risks
 
 
+# Candlestick pattern detection — informational only, not wired into the
+# composite score. Runs against the daily OHLC bars already sitting in
+# stock_agent._ohlcv_cache (populated every scan cycle for every ticker
+# anyway), so this adds zero network calls.
+#
+# Deliberately hand-rolled rather than pulling in TA-Lib/pandas-ta:
+# - TA-Lib needs a system C library — risky to add to a Railway deploy
+#   that's currently pure-Python and has no such dependency today.
+# - pandas-ta is pure Python but still a new dependency for ~6 patterns
+#   that are each a few lines of arithmetic on OHLC values already in memory.
+#
+# Deliberately inlined here rather than in its own module — a separate
+# candle_patterns.py file was tried first and reproducibly caused every
+# recommendation to silently drop to zero: the Dockerfile COPYs source
+# files by explicit name (no wildcard), the new file was never added to
+# that list, so `import candle_patterns` raised ModuleNotFoundError for
+# every single ticker, caught by the scan's broad per-ticker exception
+# handler. Living inside app.py means it can never be missing from a build.
+#
+# Only the two most recent daily bars are needed (single-candle patterns
+# use the last bar; the two two-candle patterns — engulfing — compare it to
+# the one before). Checked in priority order: a stronger/more specific
+# pattern (engulfing) wins over a weaker single-candle read (doji) when both
+# would technically match.
+def _detect_candle_pattern(df) -> Dict:
+    """df: OHLC DataFrame (columns open/high/low/close, most recent last —
+    matches stock_agent._ohlcv_cache's shape). Returns a dict with the
+    pattern name, its bullish/bearish/neutral classification, and the raw
+    OHLC of the candle being described (so the UI can draw the real shape,
+    not just a canned icon).
+
+    Returns {'pattern': 'No Data', 'signal': 'neutral', ...zeros} if df is
+    too short to evaluate — callers should treat that as "nothing to show",
+    not as a real neutral reading."""
+    empty = {"pattern": "No Data", "signal": "neutral",
+             "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0}
+    if df is None or len(df) < 1:
+        return empty
+
+    last = df.iloc[-1]
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    if h <= l:  # degenerate bar (e.g. a single trade printed) — nothing to read
+        return empty
+
+    body = abs(c - o)
+    rng = h - l
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    bullish_day = c > o
+
+    result = {"open": o, "high": h, "low": l, "close": c}
+
+    # Two-candle patterns first — they're a stronger, more specific read
+    # than anything a single bar can tell you, so they take priority.
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        po, pc = float(prev["open"]), float(prev["close"])
+        prev_body = abs(pc - po)
+        if prev_body > 0:
+            # Bullish engulfing: prior candle red, this one green and its
+            # body fully covers the prior candle's body.
+            if pc < po and c > o and o <= pc and c >= po:
+                return {**result, "pattern": "Bullish Engulfing", "signal": "bullish"}
+            # Bearish engulfing: mirror image.
+            if pc > po and c < o and o >= pc and c <= po:
+                return {**result, "pattern": "Bearish Engulfing", "signal": "bearish"}
+
+    # Single-candle patterns — body vs. range and wick-symmetry shape reads.
+    if rng > 0:
+        body_ratio = body / rng
+        # Doji: open and close are essentially the same price — indecision,
+        # not a directional read regardless of which way the day leaned.
+        if body_ratio <= 0.1:
+            return {**result, "pattern": "Doji", "signal": "neutral"}
+
+        # Marubozu: a large body with almost no wicks either side — a
+        # strong, conviction move in one direction with no real pushback.
+        if body_ratio >= 0.9:
+            return {**result, "pattern": "Bullish Marubozu" if bullish_day else "Bearish Marubozu",
+                    "signal": "bullish" if bullish_day else "bearish"}
+
+        # Hammer: small body sitting in the upper part of the range, a long
+        # lower wick (sellers pushed it down, buyers dragged it back up),
+        # little to no upper wick.
+        if lower_wick >= 2 * body and upper_wick <= body * 0.5 and body_ratio <= 0.35:
+            return {**result, "pattern": "Hammer", "signal": "bullish"}
+
+        # Shooting Star: mirror of Hammer — long upper wick, small body low
+        # in the range, little lower wick.
+        if upper_wick >= 2 * body and lower_wick <= body * 0.5 and body_ratio <= 0.35:
+            return {**result, "pattern": "Shooting Star", "signal": "bearish"}
+
+    # No named pattern — still real information: which way the day closed.
+    return {**result, "pattern": "Bullish Day" if bullish_day else "Bearish Day",
+            "signal": "bullish" if bullish_day else "bearish"}
+
+
 def _make_options_rec(ticker: str, analysis_result, price: float,
                        today_high: float = None, today_low: float = None,
                        prev_close: float = None) -> OptionsRecommendation:
@@ -785,6 +892,22 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
+    # Candlestick read — pure computation on the OHLC bars already cached
+    # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
+    # this is free: no extra network call. Deliberately the raw cache dict,
+    # NOT stock_agent._get_ohlcv() — that method's cache-miss fallback makes
+    # a live Alpaca call per ticker, and calling it here (Pass 3 runs
+    # sequentially over every candidate) turned one real scan into ~1500
+    # sequential per-ticker network calls that broke the whole run. A cache
+    # miss here just means "No Data" for that ticker's candle read.
+    candle = _detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+    # NaN is valid Python/pandas but invalid JSON per Postgres's strict
+    # parser — guarding cheaply against it regardless of a scoring/display
+    # field ever silently becoming NaN (not observed in testing).
+    for _k in ("open", "high", "low", "close"):
+        if candle[_k] != candle[_k]:  # NaN != NaN is the classic no-import check
+            candle[_k] = 0.0
+
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
     expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
@@ -818,6 +941,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         intraday_move_pct=intraday_move_pct,
         day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
         avg_dollar_volume=round(getattr(analysis_result, 'avg_dollar_volume', 0.0), 0),
+        candle_pattern=candle["pattern"],
+        candle_signal=candle["signal"],
+        candle_open=round(candle["open"], 2),
+        candle_high=round(candle["high"], 2),
+        candle_low=round(candle["low"], 2),
+        candle_close=round(candle["close"], 2),
     )
     # Computed here so every scanned rec carries them (cheap, no network calls)
     # — not just the ones enriched with catalyst data later. See call sites
@@ -1851,62 +1980,6 @@ async def system_status(credentials: HTTPAuthorizationCredentials = Depends(secu
         },
         "active_websocket_connections": len(active_connections) + len(agent_connections) + len(options_ws_connections),
     }
-
-
-@app.get("/api/v1/debug/candle-test")
-async def debug_candle_test(
-    tickers: str = "AMD,HPE,NOK,MU",
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    """DIAGNOSTIC ONLY — isolated, side-effect-free. Runs candle-pattern
-    detection against the REAL production stock_agent._ohlcv_cache for the
-    given tickers and returns the result or the exact exception/traceback,
-    without touching _make_options_rec, OptionsRecommendation, or the scan
-    pipeline in any way. Exists to find why wiring this into the real scan
-    twice caused 0 recommendations on a fresh process, despite the same
-    logic working cleanly against real Alpaca data in offline testing —
-    something only reproduces inside the live process, and this is a
-    zero-risk way to see it directly instead of guessing from another full
-    scan deploy. Remove once that's resolved either way."""
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    import traceback
-
-    # Everything below is wrapped, including the import itself — a bare
-    # 500 with no body (seen once already) means something failed OUTSIDE
-    # the per-ticker try/except that follows, so this endpoint's whole job
-    # (surface the real error instead of guessing) only works if nothing
-    # here can fail silently.
-    try:
-        from candle_patterns import detect_candle_pattern
-
-        results = {}
-        for ticker in [t.strip().upper() for t in tickers.split(",") if t.strip()]:
-            entry = {}
-            try:
-                df = stock_agent._ohlcv_cache.get(ticker) if stock_agent else None
-                entry["cache_hit"] = df is not None
-                if df is not None:
-                    entry["rows"] = len(df)
-                    entry["dtypes"] = {c: str(dt) for c, dt in df.dtypes.items()}
-                    entry["columns"] = list(df.columns)
-                entry["pattern_result"] = detect_candle_pattern(df)
-            except Exception as e:
-                entry["error"] = str(e)
-                entry["traceback"] = traceback.format_exc()
-            results[ticker] = entry
-
-        return {
-            "stock_agent_initialized": stock_agent is not None,
-            "ohlcv_cache_size": len(stock_agent._ohlcv_cache) if stock_agent else 0,
-            "results": results,
-        }
-    except Exception as e:
-        return {
-            "top_level_error": str(e),
-            "top_level_traceback": traceback.format_exc(),
-        }
 
 
 # ============================================================================
