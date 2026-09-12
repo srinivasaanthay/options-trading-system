@@ -797,9 +797,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
 
     # Candlestick read — pure computation on the OHLC bars already cached
     # for this ticker (prefetch_ohlcv runs every scan cycle regardless), so
-    # this is free: no extra network call.
+    # this is normally free (no extra network call). _get_ohlcv (not a bare
+    # ._ohlcv_cache.get) matches how analyze_ticker itself reads this data —
+    # it has its own individual-fetch fallback if this ticker's cache entry
+    # is somehow missing at this point in the scan.
     from candle_patterns import detect_candle_pattern
-    candle = detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+    candle = detect_candle_pattern(stock_agent._get_ohlcv(ticker) if stock_agent else None)
 
     strike = _strike_for_action(price, action)
     expiry = _next_monthly_expiry()
