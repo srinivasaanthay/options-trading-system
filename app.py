@@ -1872,29 +1872,41 @@ async def debug_candle_test(
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     import traceback
-    from candle_patterns import detect_candle_pattern
 
-    results = {}
-    for ticker in [t.strip().upper() for t in tickers.split(",") if t.strip()]:
-        entry = {}
-        try:
-            df = stock_agent._ohlcv_cache.get(ticker) if stock_agent else None
-            entry["cache_hit"] = df is not None
-            if df is not None:
-                entry["rows"] = len(df)
-                entry["dtypes"] = {c: str(t) for c, t in df.dtypes.items()}
-                entry["columns"] = list(df.columns)
-            entry["pattern_result"] = detect_candle_pattern(df)
-        except Exception as e:
-            entry["error"] = str(e)
-            entry["traceback"] = traceback.format_exc()
-        results[ticker] = entry
+    # Everything below is wrapped, including the import itself — a bare
+    # 500 with no body (seen once already) means something failed OUTSIDE
+    # the per-ticker try/except that follows, so this endpoint's whole job
+    # (surface the real error instead of guessing) only works if nothing
+    # here can fail silently.
+    try:
+        from candle_patterns import detect_candle_pattern
 
-    return {
-        "stock_agent_initialized": stock_agent is not None,
-        "ohlcv_cache_size": len(stock_agent._ohlcv_cache) if stock_agent else 0,
-        "results": results,
-    }
+        results = {}
+        for ticker in [t.strip().upper() for t in tickers.split(",") if t.strip()]:
+            entry = {}
+            try:
+                df = stock_agent._ohlcv_cache.get(ticker) if stock_agent else None
+                entry["cache_hit"] = df is not None
+                if df is not None:
+                    entry["rows"] = len(df)
+                    entry["dtypes"] = {c: str(dt) for c, dt in df.dtypes.items()}
+                    entry["columns"] = list(df.columns)
+                entry["pattern_result"] = detect_candle_pattern(df)
+            except Exception as e:
+                entry["error"] = str(e)
+                entry["traceback"] = traceback.format_exc()
+            results[ticker] = entry
+
+        return {
+            "stock_agent_initialized": stock_agent is not None,
+            "ohlcv_cache_size": len(stock_agent._ohlcv_cache) if stock_agent else 0,
+            "results": results,
+        }
+    except Exception as e:
+        return {
+            "top_level_error": str(e),
+            "top_level_traceback": traceback.format_exc(),
+        }
 
 
 # ============================================================================
