@@ -2555,6 +2555,16 @@ async def analyze_stock(
             raise HTTPException(status_code=404, detail=f"No price available for {ticker}")
 
         await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, [ticker, "SPY"])
+        # Own hourly prefetch — this endpoint used to rely entirely on the
+        # shared _hourly_ohlcv_cache the periodic full-market scan fills,
+        # which meant the candle read here silently went "No Data" whenever
+        # that scan hadn't run recently (e.g. weekends, or right after a
+        # deploy restarts the process and wipes it — confirmed in production:
+        # AAPL/IREN both showed "No Data" here on a Sunday with an empty
+        # cache, while the SP500 scan's own rows were fine). Single-ticker,
+        # so the batching that _prefetch_hourly_ohlcv exists for doesn't
+        # matter here.
+        await loop.run_in_executor(None, _prefetch_hourly_ohlcv, [ticker])
         extremes = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, [ticker])
         t_high, t_low = extremes.get(ticker, (None, None))
         prev_closes = await loop.run_in_executor(None, _fetch_prev_closes_batch, [ticker])
