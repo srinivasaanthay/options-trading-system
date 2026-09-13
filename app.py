@@ -148,6 +148,14 @@ class OptionsRecommendation:
     candle_high: float = 0.0
     candle_low: float = 0.0
     candle_close: float = 0.0
+    # Multi-day version of the existing same-day reversal penalty below —
+    # see _detect_fade_streak. fade_streak_days of the last fade_streak_total
+    # sessions gave back >=2% from the day's own high (CALL) or low (PUT)
+    # by the close. Unlike the same-day check, THIS is a real scoring input
+    # (a small, capped penalty) since a repeat pattern across days is a
+    # stronger signal than one day's own intraday wiggle.
+    fade_streak_days: int = 0
+    fade_streak_total: int = 0
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -828,6 +836,52 @@ def _detect_candle_pattern(df) -> Dict:
             "signal": "bullish" if bullish else "bearish"}
 
 
+FADE_STREAK_LOOKBACK_DAYS = 3
+FADE_STREAK_DAY_THRESHOLD_PCT = 2.0   # a day "counts" if it gave back this much from its own extreme
+FADE_STREAK_MIN_DAYS = 2              # need at least this many faded days (of the lookback) to flag it
+
+
+# The existing same-day reversal penalty a few lines below (intraday_move_pct)
+# only ever looks at TODAY — a ticker that faded off its high yesterday too,
+# and the day before, gets scored fresh each time with no memory of that
+# repeat. Real example that prompted this: CRWV/IREN/HOOD each rallied early
+# and gave back the gain by the close on two straight days (confirmed via
+# real hourly bars) — a pattern the existing single-day check can't see at
+# all. Pure computation on the SAME daily OHLC already cached for technical
+# scoring (stock_agent._ohlcv_cache) — no new data fetch, unlike the hourly
+# candle cache above.
+def _detect_fade_streak(df, is_bearish: bool) -> Dict:
+    """df: daily OHLC DataFrame, most recent last (stock_agent._ohlcv_cache's
+    shape). For a bullish (CALL) read, checks whether the last
+    FADE_STREAK_LOOKBACK_DAYS days each gave back >= FADE_STREAK_DAY_THRESHOLD_PCT
+    of their own high by the close (didn't hold the day's own strength). For
+    a bearish (PUT) read, checks the mirror — bouncing back from the day's
+    own low. Returns {'days': int, 'total': int, 'is_streak': bool} — days
+    is how many of the last `total` days faded; is_streak is True once days
+    >= FADE_STREAK_MIN_DAYS."""
+    empty = {"days": 0, "total": 0, "is_streak": False}
+    if df is None or len(df) < FADE_STREAK_MIN_DAYS:
+        return empty
+
+    recent = df.iloc[-FADE_STREAK_LOOKBACK_DAYS:]
+    faded_days = 0
+    for _, row in recent.iterrows():
+        h, l, c = float(row["high"]), float(row["low"]), float(row["close"])
+        if is_bearish:
+            if l <= 0:
+                continue
+            fade_pct = (c - l) / l * 100  # bounced back up from the low
+        else:
+            if h <= 0:
+                continue
+            fade_pct = (h - c) / h * 100  # gave back from the high
+        if fade_pct >= FADE_STREAK_DAY_THRESHOLD_PCT:
+            faded_days += 1
+
+    total = len(recent)
+    return {"days": faded_days, "total": total, "is_streak": faded_days >= FADE_STREAK_MIN_DAYS}
+
+
 # Separate from stock_agent._ohlcv_cache (which holds ~1y of DAILY bars for
 # technical scoring) — candle-pattern reads need hourly bars instead, since
 # that's the timeframe a short-term bullish/bearish read actually means
@@ -893,7 +947,8 @@ def _prefetch_hourly_ohlcv(tickers: List[str]) -> None:
 
 def _make_options_rec(ticker: str, analysis_result, price: float,
                        today_high: float = None, today_low: float = None,
-                       prev_close: float = None, precomputed_candle: dict = None) -> OptionsRecommendation:
+                       prev_close: float = None, precomputed_candle: dict = None,
+                       precomputed_fade_streak: tuple = None) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
     today_high/today_low (optional — from _fetch_intraday_extremes_batch) let a same-day
     reversal dampen the score even though the technical component below is daily-bar-based
@@ -904,7 +959,10 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     `ticker in stock_agent._ohlcv_cache`), rather than trusting the entry is still there by
     the time this runs — real production behavior seen: a ticker confirmed present in Pass 1
     consistently reads back empty here despite nothing in this codebase ever removing cache
-    entries, so this sidesteps that instead of relying on it."""
+    entries, so this sidesteps that instead of relying on it. precomputed_fade_streak
+    (optional) is a (bullish_result, bearish_result) tuple from _detect_fade_streak, computed
+    both ways in Pass 1 since is_bearish isn't known until here — same cache-timing reasoning
+    as precomputed_candle, just needing both directions precomputed instead of one read."""
     is_bearish = (analysis_result.technical_score < 0.48 or
                   analysis_result.buy_signal in [BuySignal.HOLD, BuySignal.AVOID])
     action = "PUT" if is_bearish else "CALL"
@@ -964,6 +1022,23 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         if intraday_move_pct >= 1.5:
             score = round(max(0.0, score - min(0.15, intraday_move_pct * 0.03)), 4)
 
+    # ── Multi-day fade-streak penalty ────────────────────────────────────────
+    # The same-day check above has no memory of yesterday — a ticker that
+    # faded off its own high/low on 2+ of the last 3 sessions gets scored
+    # fresh here each time regardless. Real example that prompted this:
+    # CRWV/IREN/HOOD each rallied early and gave the gain back by the close
+    # on two straight days. Flat 8-point penalty once the streak threshold
+    # is hit (not scaled by how much it faded — the pattern repeating is
+    # what matters here, not the size of any one day's giveback, which the
+    # same-day check above already covers) — smaller than the same-day
+    # penalty's 15-point cap since this is a slower-moving, lower-certainty
+    # signal than today's own live price action.
+    fade_streak = (precomputed_fade_streak[1] if is_bearish else precomputed_fade_streak[0]) \
+        if precomputed_fade_streak is not None \
+        else _detect_fade_streak(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None, is_bearish)
+    if fade_streak["is_streak"]:
+        score = round(max(0.0, score - 0.08), 4)
+
     confidence, buy_signal = _interpret_composite_score(score)
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
@@ -1022,6 +1097,8 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         candle_high=round(candle["high"], 2),
         candle_low=round(candle["low"], 2),
         candle_close=round(candle["close"], 2),
+        fade_streak_days=fade_streak["days"],
+        fade_streak_total=fade_streak["total"],
     )
     # Computed here so every scanned rec carries them (cheap, no network calls)
     # — not just the ones enriched with catalyst data later. See call sites
@@ -1662,11 +1739,21 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # (separate call, separate failure modes), and a miss here just means
     # "No Data" for that one ticker's candle read.
     candles: Dict[str, dict] = {}
+    # Fade-streak precomputed HERE for the same reason as candles above —
+    # this loop is the one proven-reliable point of access to
+    # stock_agent._ohlcv_cache. Direction (CALL vs PUT) isn't known until
+    # deep inside _make_options_rec, so both directions are computed once
+    # here and the right one is picked later — mirrors precomputed_candle.
+    fade_streaks: Dict[str, tuple] = {}
     for ticker in tickers:
         # Skip tickers that have no real OHLCV data (delisted / bankrupt)
         if ticker not in stock_agent._ohlcv_cache:
             continue
         candles[ticker] = _detect_candle_pattern(_hourly_ohlcv_cache.get(ticker))
+        fade_streaks[ticker] = (
+            _detect_fade_streak(stock_agent._ohlcv_cache[ticker], is_bearish=False),
+            _detect_fade_streak(stock_agent._ohlcv_cache[ticker], is_bearish=True),
+        )
 
         price = price_map.get(ticker) or _fallback_price(ticker)
         if not price or price <= 0:
@@ -1740,7 +1827,8 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
                 t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
                 rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
                                          prev_close=prev_close_map.get(ticker),
-                                         precomputed_candle=candles.get(ticker))
+                                         precomputed_candle=candles.get(ticker),
+                                         precomputed_fade_streak=fade_streaks.get(ticker))
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
