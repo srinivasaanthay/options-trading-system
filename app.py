@@ -2192,7 +2192,7 @@ async def get_sp500_options_recommendations(
         "last_analysis": last_sp500_run.isoformat() if last_sp500_run else None,
         "total_available": len(latest_options_recs),
         "count": len(recs),
-        "next_refresh_in_minutes": 20,
+        "next_refresh_in_minutes": SP500_SCAN_INTERVAL // 60,
         "recommendations": [asdict(r) for r in recs],
     }
 
