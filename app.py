@@ -134,10 +134,14 @@ class OptionsRecommendation:
     avg_dollar_volume: float = 0.0     # 20d avg shares x price — absolute liquidity/"how fast
                                         # does this normally move" measure, not self-relative
                                         # like volume_ratio
-    # Candlestick read on the most recent completed daily bar — see
-    # _detect_candle_pattern. Informational only, NOT a scoring input
-    # (adding it into the composite score would mean re-weighting and
-    # re-validating the already-calibrated 0.55/0.65/0.70/0.80 thresholds).
+    # Candlestick read on the most recent completed 1-hour bar — see
+    # _detect_candle_pattern. Hourly (not daily) because that's the
+    # timeframe people actually mean by "the last candle" for a short-term
+    # bullish/bearish read — a daily bar can't tell you what's about to
+    # happen in the next hour, only what already happened today. Purely
+    # informational, NOT a scoring input (adding it into the composite
+    # score would mean re-weighting and re-validating the already-
+    # calibrated 0.55/0.65/0.70/0.80 confidence thresholds).
     candle_pattern: str = "No Data"
     candle_signal: str = "neutral"     # "bullish" | "bearish" | "neutral" — drives the UI's color
     candle_open: float = 0.0
@@ -726,9 +730,11 @@ def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[st
 
 
 # Candlestick pattern detection — informational only, not wired into the
-# composite score. Runs against the daily OHLC bars already sitting in
-# stock_agent._ohlcv_cache (populated every scan cycle for every ticker
-# anyway), so this adds zero network calls.
+# composite score. Runs against 1-hour OHLC bars — hourly, not the daily
+# bars already cached for technical scoring, because "the last candle" for
+# a short-term bullish/bearish read is an intraday concept; a daily bar
+# only tells you what already happened today; see _prefetch_hourly_ohlcv
+# for the batched fetch this reads from (one call per scan, not per ticker).
 #
 # Deliberately hand-rolled rather than pulling in TA-Lib/pandas-ta:
 # - TA-Lib needs a system C library — risky to add to a Railway deploy
@@ -744,14 +750,14 @@ def _generate_key_factors_and_risks(rec: OptionsRecommendation) -> Tuple[List[st
 # every single ticker, caught by the scan's broad per-ticker exception
 # handler. Living inside app.py means it can never be missing from a build.
 #
-# Only the two most recent daily bars are needed (single-candle patterns
-# use the last bar; the two two-candle patterns — engulfing — compare it to
-# the one before). Checked in priority order: a stronger/more specific
-# pattern (engulfing) wins over a weaker single-candle read (doji) when both
-# would technically match.
+# Only the two most recent bars are needed (single-candle patterns use the
+# last bar; the two two-candle patterns — engulfing — compare it to the one
+# before). Checked in priority order: a stronger/more specific pattern
+# (engulfing) wins over a weaker single-candle read (doji) when both would
+# technically match.
 def _detect_candle_pattern(df) -> Dict:
-    """df: OHLC DataFrame (columns open/high/low/close, most recent last —
-    matches stock_agent._ohlcv_cache's shape). Returns a dict with the
+    """df: hourly OHLC DataFrame (columns open/high/low/close, most recent
+    last — matches _prefetch_hourly_ohlcv's shape). Returns a dict with the
     pattern name, its bullish/bearish/neutral classification, and the raw
     OHLC of the candle being described (so the UI can draw the real shape,
     not just a canned icon).
@@ -773,7 +779,7 @@ def _detect_candle_pattern(df) -> Dict:
     rng = h - l
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
-    bullish_day = c > o
+    bullish = c > o
 
     result = {"open": o, "high": h, "low": l, "close": c}
 
@@ -803,8 +809,8 @@ def _detect_candle_pattern(df) -> Dict:
         # Marubozu: a large body with almost no wicks either side — a
         # strong, conviction move in one direction with no real pushback.
         if body_ratio >= 0.9:
-            return {**result, "pattern": "Bullish Marubozu" if bullish_day else "Bearish Marubozu",
-                    "signal": "bullish" if bullish_day else "bearish"}
+            return {**result, "pattern": "Bullish Marubozu" if bullish else "Bearish Marubozu",
+                    "signal": "bullish" if bullish else "bearish"}
 
         # Hammer: small body sitting in the upper part of the range, a long
         # lower wick (sellers pushed it down, buyers dragged it back up),
@@ -817,9 +823,72 @@ def _detect_candle_pattern(df) -> Dict:
         if upper_wick >= 2 * body and lower_wick <= body * 0.5 and body_ratio <= 0.35:
             return {**result, "pattern": "Shooting Star", "signal": "bearish"}
 
-    # No named pattern — still real information: which way the day closed.
-    return {**result, "pattern": "Bullish Day" if bullish_day else "Bearish Day",
-            "signal": "bullish" if bullish_day else "bearish"}
+    # No named pattern — still real information: which way this hour closed.
+    return {**result, "pattern": "Bullish Candle" if bullish else "Bearish Candle",
+            "signal": "bullish" if bullish else "bearish"}
+
+
+# Separate from stock_agent._ohlcv_cache (which holds ~1y of DAILY bars for
+# technical scoring) — candle-pattern reads need hourly bars instead, since
+# that's the timeframe a short-term bullish/bearish read actually means
+# (see _detect_candle_pattern). A distinct cache and a distinct batched
+# fetch, refreshed once per scan cycle, same shape/pattern as
+# stock_agent.prefetch_ohlcv but never touching that cache — the two are
+# unrelated data at unrelated timeframes.
+_hourly_ohlcv_cache: Dict[str, "pd.DataFrame"] = {}
+
+
+def _prefetch_hourly_ohlcv(tickers: List[str]) -> None:
+    """Batch-fetch the last few days of hourly bars for all tickers in one
+    call per chunk (Alpaca caps a single request's symbol count) — same
+    one-request-per-N-tickers shape as stock_agent.prefetch_ohlcv, not a
+    per-ticker loop. A per-ticker version of exactly this kind of fetch is
+    what turned one real scan into ~1500 sequential network calls earlier;
+    this fetches at most len(tickers)/200 times per scan cycle, not once
+    per ticker. 5 days back comfortably covers weekends/holidays while
+    keeping each ticker to well under 100 hourly bars — plenty for the
+    2-candle patterns this needs, nowhere near the ~1y of daily history
+    stock_agent's own cache carries."""
+    global _hourly_ohlcv_cache
+    _hourly_ohlcv_cache = {}
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        key = os.environ.get('ALPACA_API_KEY', '')
+        secret = os.environ.get('ALPACA_API_SECRET', '')
+        if not (key and secret):
+            return
+        client = StockHistoricalDataClient(key, secret)
+        chunk_size = 200
+        for i in range(0, len(tickers), chunk_size):
+            chunk = tickers[i:i + chunk_size]
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=chunk,
+                    timeframe=TimeFrame.Hour,
+                    start=datetime.utcnow() - timedelta(days=5),
+                    end=datetime.utcnow(),
+                    adjustment='all',
+                )
+                raw = client.get_stock_bars(req).df
+                if raw.empty:
+                    continue
+                symbols_present = set(raw.index.get_level_values(0))
+                for ticker in chunk:
+                    if ticker not in symbols_present:
+                        continue
+                    try:
+                        tdf = raw.loc[ticker]
+                        df = tdf[['close', 'high', 'low', 'open', 'volume']].dropna(subset=['close'])
+                        if len(df) >= 1:
+                            _hourly_ohlcv_cache[ticker] = df
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"[HourlyOHLCV] chunk {i} failed: {e}")
+    except Exception as e:
+        logger.warning(f"[HourlyOHLCV] prefetch failed entirely: {e}")
 
 
 def _make_options_rec(ticker: str, analysis_result, price: float,
@@ -899,15 +968,14 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
     # Candlestick read — precomputed_candle (see docstring) is preferred;
-    # only fall back to a live cache lookup for call sites that don't pass
-    # it. Deliberately the raw cache dict, NOT stock_agent._get_ohlcv() —
-    # that method's cache-miss fallback makes a live Alpaca call per
-    # ticker, and calling it in a per-ticker loop turned one real scan into
-    # ~1500 sequential network calls that broke the whole run.
+    # only fall back to a live _hourly_ohlcv_cache lookup for the 3 call
+    # sites that don't pass it (their tickers may not be in that cache at
+    # all if the main SP500 scan hasn't run recently — a miss here just
+    # means "No Data" for those, same as any other cache miss).
     if precomputed_candle is not None:
         candle = precomputed_candle
     else:
-        candle = _detect_candle_pattern(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None)
+        candle = _detect_candle_pattern(_hourly_ohlcv_cache.get(ticker))
     # NaN is valid Python/pandas but invalid JSON per Postgres's strict
     # parser — guarding cheaply against it regardless of a scoring/display
     # field ever silently becoming NaN (not observed in testing).
@@ -1574,6 +1642,10 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # which it always was since SPY isn't one of the 500 scanned tickers.
     prefetch_list = tickers if 'SPY' in tickers else tickers + ['SPY']
     await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, prefetch_list)
+    # Separate cache, separate timeframe (hourly, not daily) — see
+    # _prefetch_hourly_ohlcv's docstring for why this is its own batched
+    # call rather than reusing stock_agent's daily-bar cache.
+    await loop.run_in_executor(None, _prefetch_hourly_ohlcv, tickers)
 
     recs: List[OptionsRecommendation] = []
     gapped_tickers: set = set()
@@ -1581,17 +1653,20 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # Pass 1 — cheap, in-memory filtering only (no network calls), sequential.
     candidates: List[Tuple[str, float]] = []
     # Candle read computed HERE, not in Pass 3 — this is the one point
-    # already proven to have this ticker's _ohlcv_cache entry (the check
-    # right below). Real production behavior: a ticker confirmed present
-    # here consistently reads back as a cache miss by the time Pass 3 runs,
-    # despite nothing in this codebase ever removing cache entries — rather
-    # than keep chasing that, read it while it's known-good.
+    # already proven reliable for the (separate, daily) _ohlcv_cache lookup
+    # right below, and read from _hourly_ohlcv_cache (see
+    # _prefetch_hourly_ohlcv) rather than stock_agent's daily cache, since
+    # an hourly bar is what "the last candle" actually means for a
+    # short-term bullish/bearish read. .get(), not direct indexing — the
+    # hourly fetch can legitimately miss a ticker the daily one has
+    # (separate call, separate failure modes), and a miss here just means
+    # "No Data" for that one ticker's candle read.
     candles: Dict[str, dict] = {}
     for ticker in tickers:
         # Skip tickers that have no real OHLCV data (delisted / bankrupt)
         if ticker not in stock_agent._ohlcv_cache:
             continue
-        candles[ticker] = _detect_candle_pattern(stock_agent._ohlcv_cache[ticker])
+        candles[ticker] = _detect_candle_pattern(_hourly_ohlcv_cache.get(ticker))
 
         price = price_map.get(ticker) or _fallback_price(ticker)
         if not price or price <= 0:
