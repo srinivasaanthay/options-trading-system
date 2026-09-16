@@ -1731,6 +1731,20 @@ def _fetch_signal_first_seen() -> Dict[Tuple[str, str], Tuple[datetime, float]]:
                 ORDER BY ticker, action, scan_time ASC
             """)
             for ticker, action, scan_time, price in cur.fetchall():
+                # psycopg2 returns TIMESTAMPTZ columns as timezone-aware
+                # datetimes; the rest of this codebase (including what gets
+                # subtracted from this in _make_options_rec) uses naive
+                # datetime.utcnow() throughout. Stripped here — not down at
+                # the subtraction — so first_seen stays a normal (naive utc)
+                # datetime everywhere it's used, same as every other
+                # timestamp in this file. Confirmed via a real production
+                # incident: every ticker crashed on this exact
+                # naive-minus-aware TypeError on the first scan cycle that
+                # had real scan_history rows to compare against, silently
+                # caught by Pass 3's per-ticker try/except and producing 0
+                # recommendations with no visible error.
+                if scan_time.tzinfo is not None:
+                    scan_time = scan_time.replace(tzinfo=None)
                 first_seen[(ticker, action)] = (scan_time, float(price))
     except Exception as e:
         logger.warning(f"[Signal freshness] first-seen fetch failed: {e}")
