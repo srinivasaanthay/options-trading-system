@@ -170,6 +170,15 @@ class OptionsRecommendation:
     # rec's own `score`/`long_term_score`, always, by construction.
     score_breakdown: dict = None
     long_term_score_breakdown: dict = None
+    # When this exact (ticker, action) signal was first surfaced, and what
+    # price it was at then — from scan_history via _fetch_signal_first_seen.
+    # signal_state is the Fresh/Active/Extended/Faded/Invalidated read
+    # derived from age + price_change_since_signal_pct — see
+    # _make_options_rec's "Signal freshness" block for the real thresholds.
+    signal_detected_at: str = ""
+    price_at_signal: float = 0.0
+    price_change_since_signal_pct: float = 0.0
+    signal_state: str = "Fresh"
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -966,7 +975,8 @@ def _prefetch_hourly_ohlcv(tickers: List[str]) -> None:
 def _make_options_rec(ticker: str, analysis_result, price: float,
                        today_high: float = None, today_low: float = None,
                        prev_close: float = None, precomputed_candle: dict = None,
-                       precomputed_fade_streak: tuple = None) -> OptionsRecommendation:
+                       precomputed_fade_streak: tuple = None,
+                       precomputed_first_seen: tuple = None) -> OptionsRecommendation:
     """Build an OptionsRecommendation from an AnalysisResult using expert multi-factor scoring.
     today_high/today_low (optional — from _fetch_intraday_extremes_batch) let a same-day
     reversal dampen the score even though the technical component below is daily-bar-based
@@ -980,7 +990,12 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     entries, so this sidesteps that instead of relying on it. precomputed_fade_streak
     (optional) is a (bullish_result, bearish_result) tuple from _detect_fade_streak, computed
     both ways in Pass 1 since is_bearish isn't known until here — same cache-timing reasoning
-    as precomputed_candle, just needing both directions precomputed instead of one read."""
+    as precomputed_candle, just needing both directions precomputed instead of one read.
+    precomputed_first_seen (optional) is a (detected_at, price_at_signal) tuple from
+    _fetch_signal_first_seen, keyed by (ticker, action) — action isn't known until here either,
+    so Pass 1 passes the single dict entry for this exact (ticker, action) pair (unlike
+    precomputed_fade_streak, first-seen doesn't need both directions precomputed since a
+    ticker's CALL and PUT rows in scan_history are already separate keys)."""
     is_bearish = (analysis_result.technical_score < 0.48 or
                   analysis_result.buy_signal in [BuySignal.HOLD, BuySignal.AVOID])
     action = "PUT" if is_bearish else "CALL"
@@ -1066,6 +1081,42 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         fade_streak_penalty = round(pre - score, 4)
 
     confidence, buy_signal = _interpret_composite_score(score)
+
+    # ── Signal freshness ──────────────────────────────────────────────────
+    # When was THIS exact (ticker, action) signal first surfaced, and how
+    # has price moved since — the basis for signal_state below. No
+    # precomputed_first_seen (on-demand /analyze calls, or a ticker's
+    # first-ever appearance today) means there's no history to distrust
+    # yet, so it's always "detected right now" — never a false Extended/
+    # Faded/Invalidated claim from missing data.
+    signal_detected_at, price_at_signal = precomputed_first_seen or (datetime.utcnow(), price)
+    age_minutes = (datetime.utcnow() - signal_detected_at).total_seconds() / 60.0
+    if price_at_signal > 0:
+        # Positive = price moved IN FAVOR of the thesis since signal (up for
+        # a CALL, down for a PUT) — mirrors the same direction convention
+        # used throughout this function (e.g. the same-day reversal penalty).
+        price_change_since_signal_pct = round(
+            (price - price_at_signal) / price_at_signal * 100 * (1 if not is_bearish else -1), 2)
+    else:
+        price_change_since_signal_pct = 0.0
+
+    # Thresholds reuse the app's own already-calibrated numbers rather than
+    # inventing new ones: 1.5% matches the same-day reversal penalty above,
+    # 5% matches the "EXT" big-move threshold this replaces. Checked in this
+    # order — Fresh first (too new to judge), then Invalidated (the
+    # composite score itself has degraded — a stronger claim than a price
+    # wiggle), then Faded/Extended by price move, else Active.
+    if age_minutes < 15:
+        signal_state = "Fresh"
+    elif buy_signal in ("HOLD", "AVOID"):
+        signal_state = "Invalidated"
+    elif price_change_since_signal_pct <= -1.5:
+        signal_state = "Faded"
+    elif price_change_since_signal_pct >= 5.0:
+        signal_state = "Extended"
+    else:
+        signal_state = "Active"
+
     upside_score = min(1.0, max(0.0, upside / 30.0))
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
 
@@ -1156,6 +1207,10 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         analyst_count=getattr(analysis_result, 'analyst_count', 0),
         score_breakdown=score_breakdown,
         long_term_score_breakdown=long_term_score_breakdown,
+        signal_detected_at=signal_detected_at.isoformat(),
+        price_at_signal=round(price_at_signal, 2),
+        price_change_since_signal_pct=price_change_since_signal_pct,
+        signal_state=signal_state,
         long_term_score=long_term_score,
         intraday_move_pct=intraday_move_pct,
         day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
@@ -1653,6 +1708,35 @@ def _fetch_intraday_extremes_batch(tickers: List[str]) -> Dict[str, Tuple[float,
     return extremes
 
 
+def _fetch_signal_first_seen() -> Dict[Tuple[str, str], Tuple[datetime, float]]:
+    """Earliest scan_time + price today for every (ticker, action) pair
+    already in scan_history — i.e. "when did we first flag this exact
+    signal, and at what price" — the basis for signal_state/age below.
+    One query per scan cycle, not per-ticker, same batching discipline as
+    _fetch_prev_closes_batch/_fetch_intraday_extremes_batch above. Reuses
+    the same scan_history table those write to (app.py's own persistence,
+    not a new table) — see _save_scan_history_pg. Fails open: a miss (no
+    Postgres, or a ticker with no rows yet today) just means the caller
+    falls back to "detected now," never a crash or a false claim."""
+    first_seen: Dict[Tuple[str, str], Tuple[datetime, float]] = {}
+    conn = _get_pg_conn()
+    if conn is None:
+        return first_seen
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (ticker, action) ticker, action, scan_time, current_price
+                FROM scan_history
+                WHERE scan_time::date = CURRENT_DATE
+                ORDER BY ticker, action, scan_time ASC
+            """)
+            for ticker, action, scan_time, price in cur.fetchall():
+                first_seen[(ticker, action)] = (scan_time, float(price))
+    except Exception as e:
+        logger.warning(f"[Signal freshness] first-seen fetch failed: {e}")
+    return first_seen
+
+
 def _fetch_prices_batch(tickers: List[str]) -> Dict[str, float]:
     """Fetch real-time mid-prices via Alpaca snapshots. Falls back to yfinance on failure."""
     prices: Dict[str, float] = {}
@@ -1783,6 +1867,9 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
     prev_close_map = await loop.run_in_executor(None, _fetch_prev_closes_batch, tickers)
     intraday_extremes_map = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, tickers)
+    # One query for every (ticker, action) already in today's scan_history —
+    # not per-ticker, same batching discipline as the two fetches above.
+    first_seen_map = await loop.run_in_executor(None, _fetch_signal_first_seen)
     # SPY must be cached too — rs_vs_spy (25% of the composite score) reads it
     # from _ohlcv_cache directly and silently defaults to 0.0 if it's missing,
     # which it always was since SPY isn't one of the 500 scanned tickers.
@@ -1894,10 +1981,15 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             is_bearish = result.technical_score <= 0.45
             if is_bullish or is_bearish:
                 t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
+                # Matches _make_options_rec's own internal is_bearish check —
+                # never disagrees in practice since that check's 0.48 cutoff
+                # sits strictly between this gate's 0.55/0.45 thresholds.
+                action = "PUT" if is_bearish else "CALL"
                 rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
                                          prev_close=prev_close_map.get(ticker),
                                          precomputed_candle=candles.get(ticker),
-                                         precomputed_fade_streak=fade_streaks.get(ticker))
+                                         precomputed_fade_streak=fade_streaks.get(ticker),
+                                         precomputed_first_seen=first_seen_map.get((ticker, action)))
                 if rec.score >= 0.55:  # minimum signal strength
                     recs.append(rec)
 
