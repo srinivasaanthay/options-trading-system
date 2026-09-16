@@ -114,6 +114,9 @@ class AnalysisResult:
     rs_vs_spy: float = 0.0          # 5d return relative to SPY (e.g. +2.0 = outperformed by 2%)
     days_to_earnings: int = 999     # days until next earnings announcement
     fundamental_score: float = 0.5  # 0-1 from analyst targets + short interest
+    analyst_count: int = 0          # analysts covering this ticker — < 3 means
+                                     # fundamental_score above is a neutral default,
+                                     # not a real read (see _fetch_real_fundamental_data)
     analyst_upside: float = 0.0     # analyst consensus target vs current price (%)
     short_interest_pct: float = 0.0 # short interest as % of float
     rsi: float = 50.0               # 14-day RSI — was computed for scoring and discarded;
@@ -334,6 +337,7 @@ class MCPStockAgent:
                 rs_vs_spy=technical_data.get('rs_vs_spy', 0.0),
                 days_to_earnings=days_to_earn,
                 fundamental_score=fundamental.get('fundamental_score', 0.5),
+                analyst_count=fundamental.get('analyst_count', 0),
                 analyst_upside=fundamental.get('analyst_upside', 0.0),
                 short_interest_pct=fundamental.get('short_interest_pct', 0.0),
                 rsi=technical_data.get('rsi', 50.0),

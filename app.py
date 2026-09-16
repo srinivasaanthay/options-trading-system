@@ -156,6 +156,20 @@ class OptionsRecommendation:
     # stronger signal than one day's own intraday wiggle.
     fade_streak_days: int = 0
     fade_streak_total: int = 0
+    # Analysts covering this ticker — < 3 means fundamental_score (and the
+    # "Fundamentals" component below) is a neutral default, not a real
+    # read. See mcp_stock_agent.py's _fetch_real_fundamental_data.
+    analyst_count: int = 0
+    # The REAL composite-score math, exposed so the UI never has to (and
+    # never again silently drifts from) reconstruct it client-side — see
+    # _make_options_rec's "Expert composite score" block for where this is
+    # built. Shape: {"components": [{"label", "weight", "value", "contribution"}],
+    # "adjustments": [{"label", "amount"}], "final_score": float}. adjustments
+    # only lists ones that actually applied (same-day reversal / fade streak).
+    # sum(contributions) + sum(adjustment amounts) == final_score == this
+    # rec's own `score`/`long_term_score`, always, by construction.
+    score_breakdown: dict = None
+    long_term_score_breakdown: dict = None
 
     def __post_init__(self):
         if self.news_headlines is None:
@@ -166,6 +180,10 @@ class OptionsRecommendation:
             self.key_factors = []
         if self.risks is None:
             self.risks = []
+        if self.score_breakdown is None:
+            self.score_breakdown = {}
+        if self.long_term_score_breakdown is None:
+            self.long_term_score_breakdown = {}
 
 
 def _next_monthly_expiry(from_date: datetime = None) -> str:
@@ -1013,14 +1031,19 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     # above can't see that on its own. Penalty is capped at 15 points so a
     # single intraday wiggle can't wipe out an otherwise-strong signal.
     intraday_move_pct = 0.0
+    same_day_penalty = 0.0  # actual delta applied (post 0-floor clip) — see score_breakdown below
     if not is_bearish and today_high and today_high > 0 and price < today_high:
         intraday_move_pct = round((price - today_high) / today_high * 100, 2)
         if intraday_move_pct <= -1.5:
+            pre = score
             score = round(max(0.0, score - min(0.15, abs(intraday_move_pct) * 0.03)), 4)
+            same_day_penalty = round(pre - score, 4)
     elif is_bearish and today_low and today_low > 0 and price > today_low:
         intraday_move_pct = round((price - today_low) / today_low * 100, 2)
         if intraday_move_pct >= 1.5:
+            pre = score
             score = round(max(0.0, score - min(0.15, intraday_move_pct * 0.03)), 4)
+            same_day_penalty = round(pre - score, 4)
 
     # ── Multi-day fade-streak penalty ────────────────────────────────────────
     # The same-day check above has no memory of yesterday — a ticker that
@@ -1036,11 +1059,54 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
     fade_streak = (precomputed_fade_streak[1] if is_bearish else precomputed_fade_streak[0]) \
         if precomputed_fade_streak is not None \
         else _detect_fade_streak(stock_agent._ohlcv_cache.get(ticker) if stock_agent else None, is_bearish)
+    fade_streak_penalty = 0.0  # actual delta applied — see score_breakdown below
     if fade_streak["is_streak"]:
+        pre = score
         score = round(max(0.0, score - 0.08), 4)
+        fade_streak_penalty = round(pre - score, 4)
 
     confidence, buy_signal = _interpret_composite_score(score)
+    upside_score = min(1.0, max(0.0, upside / 30.0))
     long_term_score = _compute_long_term_score(tech, rs_score, fund, upside, is_bearish)
+
+    # ── Score breakdown (single source of truth for the UI) ─────────────────
+    # Mirrors the composite-score math above exactly — same direction-
+    # adjusted values, same weights — plus whichever penalties actually
+    # applied, in the same score-point units as `score`/`long_term_score`
+    # themselves. The UI renders this directly instead of ever
+    # reconstructing the formula client-side (see DashboardView.swift's
+    # ScoreBreakdownCard) — the two can never disagree again since they're
+    # built from the exact same variables in the exact same call.
+    if is_bearish:
+        _st_components = [("Technical", 0.30, 1.0 - tech), ("RS vs SPY", 0.25, 1.0 - rs_score),
+                           ("IV Rank", 0.20, iv_score), ("Volume", 0.15, vol_score),
+                           ("Fundamentals", 0.10, 1.0 - fund)]
+        _lt_components = [("Fundamentals", 0.40, 1.0 - fund), ("Analyst Upside", 0.25, 1.0 - upside_score),
+                           ("Technical", 0.25, 1.0 - tech), ("RS vs SPY", 0.10, 1.0 - rs_score)]
+    else:
+        _st_components = [("Technical", 0.30, tech), ("RS vs SPY", 0.25, rs_score),
+                           ("IV Rank", 0.20, iv_score), ("Volume", 0.15, vol_score),
+                           ("Fundamentals", 0.10, fund)]
+        _lt_components = [("Fundamentals", 0.40, fund), ("Analyst Upside", 0.25, upside_score),
+                           ("Technical", 0.25, tech), ("RS vs SPY", 0.10, rs_score)]
+
+    def _breakdown(components: list, adjustments: list, final_score: float) -> dict:
+        return {
+            "components": [
+                {"label": label, "weight": weight, "value": round(value, 4),
+                 "contribution": round(weight * value, 4)}
+                for label, weight, value in components
+            ],
+            "adjustments": [{"label": label, "amount": -amt} for label, amt in adjustments if amt],
+            "final_score": final_score,
+        }
+
+    score_breakdown = _breakdown(
+        _st_components,
+        [("Same-day reversal", same_day_penalty), ("Multi-day fade streak", fade_streak_penalty)],
+        score,
+    )
+    long_term_score_breakdown = _breakdown(_lt_components, [], long_term_score)
 
     # Candlestick read — precomputed_candle (see docstring) is preferred;
     # only fall back to a live _hourly_ohlcv_cache lookup for the 3 call
@@ -1087,6 +1153,9 @@ def _make_options_rec(ticker: str, analysis_result, price: float,
         rs_vs_spy=round(getattr(analysis_result, 'rs_vs_spy', 0.0), 2),
         days_to_earnings=getattr(analysis_result, 'days_to_earnings', 999),
         analyst_upside=round(getattr(analysis_result, 'analyst_upside', 0.0), 1),
+        analyst_count=getattr(analysis_result, 'analyst_count', 0),
+        score_breakdown=score_breakdown,
+        long_term_score_breakdown=long_term_score_breakdown,
         long_term_score=long_term_score,
         intraday_move_pct=intraday_move_pct,
         day_change_pct=round((price - prev_close) / prev_close * 100, 2) if prev_close else 0.0,
