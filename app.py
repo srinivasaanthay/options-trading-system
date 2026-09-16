@@ -1968,10 +1968,16 @@ async def _sp500_scheduler_loop():
             # cycle (observed in production: ~4 hours, likely driven by
             # repeated yfinance retries against a garbage ticker) blocks this
             # loop forever, since try/except only catches raised errors, not
-            # a hang. 90s leaves real headroom over the ~30-60s happy-path
-            # scan time while staying under the 120s cycle interval, so a
-            # timeout can never cascade into the next cycle also stalling.
-            recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=90)  # also executes paper trades internally
+            # a hang. The 90s budget this used to have assumed a ~30-60s
+            # happy-path scan time, which stopped being true as the ticker
+            # universe grew — confirmed in production on 2026-09-16: two
+            # consecutive manual full scans over 1657 tickers took 158s and
+            # 188s, meaning EVERY automatic cycle had been hitting the 90s
+            # timeout and getting cancelled all morning (last_run stuck null,
+            # zero signals shown) despite the scan itself working fine. 240s
+            # leaves real headroom over the observed worst case while still
+            # catching genuine multi-hour hangs.
+            recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=240)  # also executes paper trades internally
 
             # Push to all connected WebSocket clients
             if options_ws_connections and recs:
@@ -2192,7 +2198,12 @@ async def get_sp500_options_recommendations(
         "last_analysis": last_sp500_run.isoformat() if last_sp500_run else None,
         "total_available": len(latest_options_recs),
         "count": len(recs),
-        "next_refresh_in_minutes": SP500_SCAN_INTERVAL // 60,
+        # SP500_SCAN_INTERVAL alone (2 min) understates this — that's just
+        # the sleep between cycles, not the scan itself, which now takes
+        # 2.5-3 min over the current 1657-ticker universe (see the scheduler
+        # loop's timeout comment). ~5 min total is a rough but honest
+        # estimate of real end-to-end cadence, not a precise measurement.
+        "next_refresh_in_minutes": SP500_SCAN_INTERVAL // 60 + 3,
         "recommendations": [asdict(r) for r in recs],
     }
 
