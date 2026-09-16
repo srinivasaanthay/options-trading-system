@@ -1144,87 +1144,106 @@ class MCPStockAgent:
             if (now - fetched_at).total_seconds() < 300:
                 return cached
 
-        try:
-            import yfinance as yf
-            t = yf.Ticker(ticker)
-            expirations = t.options
-            if not expirations:
-                raise ValueError("no options chain")
+        # Bounded retry — production showed the real IV-rank computation
+        # below succeeding for the large majority of individual tickers
+        # when tested directly (0.1-0.3s each, no errors), but defaulting
+        # to the neutral-50 mock fallback for most of the ~1660-ticker
+        # scan universe in practice. That gap points to yfinance's
+        # options-chain endpoint being rate-limited under the scan's bulk
+        # request volume rather than a logic bug in the fetch itself — a
+        # short retry recovers the transient case cheaply. IV rank is a
+        # real 20%-weighted scoring input, so silently defaulting it for
+        # most tickers was quietly flattening a fifth of the score.
+        import time
+        last_error: Exception = None
+        for attempt in range(2):
+            if attempt > 0:
+                time.sleep(0.5)
+            try:
+                import yfinance as yf
+                t = yf.Ticker(ticker)
+                expirations = t.options
+                if not expirations:
+                    raise ValueError("no options chain")
 
-            # Pick nearest expiry that is at least 7 days away
-            expiry = expirations[0]
-            for exp in expirations:
-                from datetime import date as _date
-                exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-                if (exp_date - _date.today()).days >= 7:
-                    expiry = exp
-                    break
+                # Pick nearest expiry that is at least 7 days away
+                expiry = expirations[0]
+                for exp in expirations:
+                    from datetime import date as _date
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                    if (exp_date - _date.today()).days >= 7:
+                        expiry = exp
+                        break
 
-            chain = t.option_chain(expiry)
-            calls_df = chain.calls.copy()
-            puts_df  = chain.puts.copy()
+                chain = t.option_chain(expiry)
+                calls_df = chain.calls.copy()
+                puts_df  = chain.puts.copy()
 
-            # ATM window: ±10% of current price
-            lo, hi = price * 0.90, price * 1.10
-            atm_calls = calls_df[(calls_df['strike'] >= lo) & (calls_df['strike'] <= hi)]
-            atm_puts  = puts_df[ (puts_df['strike']  >= lo) & (puts_df['strike']  <= hi)]
+                # ATM window: ±10% of current price
+                lo, hi = price * 0.90, price * 1.10
+                atm_calls = calls_df[(calls_df['strike'] >= lo) & (calls_df['strike'] <= hi)]
+                atm_puts  = puts_df[ (puts_df['strike']  >= lo) & (puts_df['strike']  <= hi)]
 
-            call_iv = float(atm_calls['impliedVolatility'].mean()) if not atm_calls.empty else 0.25
-            put_iv  = float(atm_puts['impliedVolatility'].mean())  if not atm_puts.empty  else 0.25
-            call_iv = call_iv if np.isfinite(call_iv) and call_iv > 0 else 0.25
-            put_iv  = put_iv  if np.isfinite(put_iv)  and put_iv  > 0 else 0.25
+                call_iv = float(atm_calls['impliedVolatility'].mean()) if not atm_calls.empty else 0.25
+                put_iv  = float(atm_puts['impliedVolatility'].mean())  if not atm_puts.empty  else 0.25
+                call_iv = call_iv if np.isfinite(call_iv) and call_iv > 0 else 0.25
+                put_iv  = put_iv  if np.isfinite(put_iv)  and put_iv  > 0 else 0.25
 
-            # Put/call OI ratio — > 1 is bearish skew
-            call_oi = float(atm_calls['openInterest'].fillna(0).sum())
-            put_oi  = float(atm_puts['openInterest'].fillna(0).sum())
-            pc_ratio = put_oi / max(call_oi, 1)
+                # Put/call OI ratio — > 1 is bearish skew
+                call_oi = float(atm_calls['openInterest'].fillna(0).sum())
+                put_oi  = float(atm_puts['openInterest'].fillna(0).sum())
+                pc_ratio = put_oi / max(call_oi, 1)
 
-            def _top_recs(df, n=2):
-                if df.empty:
-                    return []
-                top = df.nlargest(n, 'volume') if 'volume' in df.columns else df.head(n)
-                recs = []
-                for _, row in top.iterrows():
-                    iv = float(row.get('impliedVolatility', 0.25))
-                    iv = iv if np.isfinite(iv) and iv > 0 else 0.25
-                    recs.append({
-                        'strike': float(row['strike']),
-                        'suitability': {'option_score': min(95, int(iv * 150 + 40))}
-                    })
-                return recs
+                def _top_recs(df, n=2):
+                    if df.empty:
+                        return []
+                    top = df.nlargest(n, 'volume') if 'volume' in df.columns else df.head(n)
+                    recs = []
+                    for _, row in top.iterrows():
+                        iv = float(row.get('impliedVolatility', 0.25))
+                        iv = iv if np.isfinite(iv) and iv > 0 else 0.25
+                        recs.append({
+                            'strike': float(row['strike']),
+                            'suitability': {'option_score': min(95, int(iv * 150 + 40))}
+                        })
+                    return recs
 
-            # ── IV Rank (proxy via realized vol comparison) ──────────────────
-            # Compare ATM implied vol to 20-day historical vol.
-            # IV/HV ratio > 2 = expensive options (rank ~100), < 0.7 = cheap (rank ~0).
-            iv_rank = 50.0
-            hv_df = self._ohlcv_cache.get(ticker)
-            if hv_df is not None and len(hv_df) >= 21:
-                log_ret = np.log(hv_df['close'].astype(float) / hv_df['close'].astype(float).shift(1)).dropna()
-                hv20 = float(log_ret.tail(20).std() * np.sqrt(252))
-                if hv20 > 0:
-                    iv_hv_ratio = call_iv / hv20
-                    # ratio 0.7 → rank 0, ratio 1.0 → rank 33, ratio 2.0 → rank 100
-                    iv_rank = round(min(100.0, max(0.0, (iv_hv_ratio - 0.7) / 1.3 * 100)), 1)
+                # ── IV Rank (proxy via realized vol comparison) ──────────────────
+                # Compare ATM implied vol to 20-day historical vol.
+                # IV/HV ratio > 2 = expensive options (rank ~100), < 0.7 = cheap (rank ~0).
+                iv_rank = 50.0
+                hv_df = self._ohlcv_cache.get(ticker)
+                if hv_df is not None and len(hv_df) >= 21:
+                    log_ret = np.log(hv_df['close'].astype(float) / hv_df['close'].astype(float).shift(1)).dropna()
+                    hv20 = float(log_ret.tail(20).std() * np.sqrt(252))
+                    if hv20 > 0:
+                        iv_hv_ratio = call_iv / hv20
+                        # ratio 0.7 → rank 0, ratio 1.0 → rank 33, ratio 2.0 → rank 100
+                        iv_rank = round(min(100.0, max(0.0, (iv_hv_ratio - 0.7) / 1.3 * 100)), 1)
 
-            result = {
-                'calls': {
-                    'recommendations': _top_recs(atm_calls) or [{'strike': round(price * 1.05), 'suitability': {'option_score': 60}}],
-                    'avg_iv': call_iv
-                },
-                'puts': {
-                    'recommendations': _top_recs(atm_puts) or [{'strike': round(price * 0.95), 'suitability': {'option_score': 55}}],
-                    'avg_iv': put_iv
-                },
-                'pc_ratio': pc_ratio,
-                'iv_rank': iv_rank,
-            }
-            self._options_cache[ticker] = (result, now)
-            logger.debug(f"[Options] {ticker} call_iv={call_iv:.2f} put_iv={put_iv:.2f} pc={pc_ratio:.2f}")
-            return result
+                result = {
+                    'calls': {
+                        'recommendations': _top_recs(atm_calls) or [{'strike': round(price * 1.05), 'suitability': {'option_score': 60}}],
+                        'avg_iv': call_iv
+                    },
+                    'puts': {
+                        'recommendations': _top_recs(atm_puts) or [{'strike': round(price * 0.95), 'suitability': {'option_score': 55}}],
+                        'avg_iv': put_iv
+                    },
+                    'pc_ratio': pc_ratio,
+                    'iv_rank': iv_rank,
+                }
+                self._options_cache[ticker] = (result, now)
+                logger.debug(f"[Options] {ticker} call_iv={call_iv:.2f} put_iv={put_iv:.2f} pc={pc_ratio:.2f}")
+                return result
 
-        except Exception as e:
-            logger.debug(f"[Options] {ticker} fetch failed: {e}")
-            return self._generate_options_data()
+            except Exception as e:
+                last_error = e
+                logger.debug(f"[Options] {ticker} fetch attempt {attempt + 1} failed: {e}")
+                continue
+
+        logger.debug(f"[Options] {ticker} fetch failed after retry: {last_error}")
+        return self._generate_options_data()
 
     # -----------------------------------------------------------------------
     # Expert signals: earnings date + fundamental data
