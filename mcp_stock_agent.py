@@ -1175,30 +1175,41 @@ class MCPStockAgent:
             exp_lo = _date.today() + _timedelta(days=14)
             exp_hi = _date.today() + _timedelta(days=45)
 
-            def _fetch_side(contract_type):
-                req = GetOptionContractsRequest(
-                    underlying_symbols=[ticker],
-                    expiration_date_gte=exp_lo,
-                    expiration_date_lte=exp_hi,
-                    strike_price_gte=str(lo),
-                    strike_price_lte=str(hi),
-                    type=contract_type,
-                )
-                resp = trading_client.get_option_contracts(req)
-                contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
-                return contracts[:20]  # cap — snapshot batch size, and this is already a tight ATM window
+            # 2 network calls total per ticker (1 contract list + 1 batched
+            # snapshot), not 4 — an earlier version fetched calls/puts as
+            # separate contract-list AND separate snapshot calls, which was
+            # fine per-ticker but made the full ~1660-ticker scan take
+            # ~15 minutes instead of the usual ~3, risking every automatic
+            # scheduler cycle hitting its own 240s timeout. Alpaca returns
+            # both contract types in one call when `type` is omitted.
+            # limit=30 cut the contract-list call from 3-6s to <0.1s for
+            # most tickers in direct testing (heavily-optioned tickers were
+            # the slow ones — Alpaca's backend appears to spend that time
+            # server-side building the larger unlimited result set before
+            # this client ever sees it). Some individual calls still run
+            # slow regardless (observed variability isn't tied to any one
+            # ticker consistently) — 16-way scan concurrency and the
+            # scheduler's own 240s cycle timeout are the backstops for that
+            # residual variance, not something fixable purely client-side.
+            req = GetOptionContractsRequest(
+                underlying_symbols=[ticker],
+                expiration_date_gte=exp_lo,
+                expiration_date_lte=exp_hi,
+                strike_price_gte=str(lo),
+                strike_price_lte=str(hi),
+                limit=30,
+            )
+            resp = trading_client.get_option_contracts(req)
+            all_contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
+            calls = [c for c in all_contracts if c.type == ContractType.CALL][:15]
+            puts = [c for c in all_contracts if c.type == ContractType.PUT][:15]
 
-            calls = _fetch_side(ContractType.CALL)
-            puts = _fetch_side(ContractType.PUT)
-
-            def _snapshots_for(contracts):
-                if not contracts:
-                    return {}
-                req = OptionSnapshotRequest(symbol_or_symbols=[c.symbol for c in contracts])
-                return data_client.get_option_snapshot(req)
-
-            call_snaps = _snapshots_for(calls)
-            put_snaps = _snapshots_for(puts)
+            snaps = {}
+            symbols = [c.symbol for c in calls + puts]
+            if symbols:
+                snap_req = OptionSnapshotRequest(symbol_or_symbols=symbols)
+                snaps = data_client.get_option_snapshot(snap_req)
+            call_snaps = put_snaps = snaps  # same combined dict, kept as two names below for minimal diff
 
             def _ivs(contracts, snaps):
                 vals = []
