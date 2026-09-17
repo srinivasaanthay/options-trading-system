@@ -1347,27 +1347,54 @@ def _compute_catalyst_freshness(ticker: str, headlines: list, current_price: flo
 
 
 def _fetch_fundamentals(ticker: str) -> dict:
-    """Fetch key fundamental metrics from yfinance for display in Before You Buy."""
+    """Fetch key fundamental metrics for display in Before You Buy.
+    Finnhub-backed — replaced yfinance's .info scrape (see
+    mcp_stock_agent.py's _fetch_real_options_data docstring for the
+    yfinance-removal incident this is part of). Display-only, not a
+    scoring input, so partial coverage is an acceptable degradation:
+    Finnhub's free-tier /stock/metric endpoint has no direct equivalent
+    for total_cash/free_cashflow/operating_cashflow (it exposes ratios
+    and per-share figures, not raw balance-sheet dollar amounts) — those
+    three stay None (the existing _f() / iOS side already treat None as
+    "omit this row", not a fake zero) rather than being approximated.
+    The growth/margin/ROE fields Finnhub does have come back as whole
+    percentages (e.g. 14.24 meaning 14.24%) where yfinance's equivalent
+    fields were fractions (0.1424) — divided by 100 here so the stored
+    value keeps the same units the existing display code already expects,
+    with no iOS change needed."""
     try:
-        info = yf.Ticker(ticker).info
-        def _f(key, default=None):
-            v = info.get(key)
-            return None if v is None or (isinstance(v, float) and (v != v)) else v
+        import requests
+        api_key = os.environ.get('FINNHUB_API_KEY', '')
+        if not api_key:
+            raise RuntimeError("Finnhub API key not configured")
+        resp = requests.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": ticker, "metric": "all", "token": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        m = resp.json().get("metric") or {}
+
+        def _f(key, scale=1.0):
+            v = m.get(key)
+            if v is None or (isinstance(v, float) and v != v):
+                return None
+            return v / scale
 
         return {
-            "debt_to_equity":   _f("debtToEquity"),
-            "current_ratio":    _f("currentRatio"),
-            "total_cash":       _f("totalCash"),
-            "free_cashflow":    _f("freeCashflow"),
-            "operating_cashflow": _f("operatingCashflow"),
-            "revenue_growth":   _f("revenueGrowth"),
-            "earnings_growth":  _f("earningsGrowth"),
-            "profit_margins":   _f("profitMargins"),
-            "gross_margins":    _f("grossMargins"),
-            "trailing_pe":      _f("trailingPE"),
+            "debt_to_equity":   _f("totalDebt/totalEquityQuarterly"),
+            "current_ratio":    _f("currentRatioQuarterly"),
+            "total_cash":       None,   # no free raw-dollar equivalent on Finnhub
+            "free_cashflow":    None,   # no free raw-dollar equivalent on Finnhub
+            "operating_cashflow": None, # no free raw-dollar equivalent on Finnhub
+            "revenue_growth":   _f("revenueGrowthTTMYoy", scale=100.0),
+            "earnings_growth":  _f("epsGrowthTTMYoy", scale=100.0),
+            "profit_margins":   _f("netProfitMarginTTM", scale=100.0),
+            "gross_margins":    _f("grossMarginTTM", scale=100.0),
+            "trailing_pe":      _f("peTTM"),
             "forward_pe":       _f("forwardPE"),
-            "price_to_book":    _f("priceToBook"),
-            "return_on_equity": _f("returnOnEquity"),
+            "price_to_book":    _f("pbQuarterly"),
+            "return_on_equity": _f("roeTTM", scale=100.0),
         }
     except Exception as e:
         logger.debug("[Fundamentals] %s failed: %s", ticker, e)

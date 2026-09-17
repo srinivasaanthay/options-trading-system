@@ -1286,7 +1286,14 @@ class MCPStockAgent:
     # -----------------------------------------------------------------------
 
     def _fetch_earnings_date(self, ticker: str) -> int:
-        """Return days until next earnings announcement (999 = unknown/far out). 24h cache."""
+        """Return days until next earnings announcement (999 = unknown/far out). 24h cache.
+        Finnhub-backed — replaced yfinance's .calendar scrape as part of
+        removing yfinance entirely after Yahoo blocked Railway's production
+        IP (see _fetch_real_options_data's docstring for the full incident).
+        Free-tier Finnhub confirmed working for this specific endpoint via
+        direct testing (real upcoming dates for AAPL/AMD/MSFT, empty array
+        for a nonexistent ticker — no auth/tier restriction hit here, unlike
+        the price-target endpoint)."""
         now = datetime.utcnow()
         if ticker in self._earnings_cache:
             cached_days, fetched_at = self._earnings_cache[ticker]
@@ -1294,30 +1301,49 @@ class MCPStockAgent:
                 return cached_days
         days = 999
         try:
-            import yfinance as yf
-            from datetime import date as _date
-            cal = yf.Ticker(ticker).calendar
-            if cal is not None and not (hasattr(cal, 'empty') and cal.empty):
-                # Newer yfinance: dict with 'Earnings Date' key
-                if isinstance(cal, dict):
-                    earn = cal.get('Earnings Date')
-                    if earn:
-                        earn_dt = earn[0] if isinstance(earn, list) else earn
-                        if hasattr(earn_dt, 'date'):
-                            days = max(0, (earn_dt.date() - _date.today()).days)
-                # Older yfinance: DataFrame with 'Earnings Date' row
-                elif hasattr(cal, 'loc'):
-                    if 'Earnings Date' in cal.index:
-                        val = cal.loc['Earnings Date'].iloc[0]
-                        if hasattr(val, 'date'):
-                            days = max(0, (val.date() - _date.today()).days)
-        except Exception:
-            pass
+            import requests
+            from datetime import date as _date, timedelta as _timedelta
+            api_key = os.environ.get('FINNHUB_API_KEY', '')
+            if not api_key:
+                raise RuntimeError("Finnhub API key not configured")
+            today = _date.today()
+            resp = requests.get(
+                "https://finnhub.io/api/v1/calendar/earnings",
+                params={
+                    "from": today.isoformat(),
+                    "to": (today + _timedelta(days=180)).isoformat(),
+                    "symbol": ticker,
+                    "token": api_key,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            events = resp.json().get("earningsCalendar") or []
+            if events:
+                # Events come back sorted by date already; take the soonest.
+                earn_date = _date.fromisoformat(events[0]["date"])
+                days = max(0, (earn_date - today).days)
+        except Exception as e:
+            logger.debug(f"[Earnings] {ticker} Finnhub fetch failed: {e}")
         self._earnings_cache[ticker] = (days, now)
         return days
 
     def _fetch_real_fundamental_data(self, ticker: str, price: float) -> Dict:
-        """Fetch analyst price targets and short interest. 4-hour cache."""
+        """Fetch analyst consensus and short interest. 4-hour cache.
+        Finnhub-backed — replaced yfinance's .info scrape (see
+        _fetch_real_options_data's docstring for the yfinance-removal
+        incident this is part of). Finnhub's free tier blocks its
+        price-target endpoint outright ("You don't have access to this
+        resource", confirmed directly) and has no short-interest data at
+        any tier we tested — only its recommendation-trends endpoint
+        (buy/hold/sell analyst counts) is both free and populated. Per
+        explicit product decision: analyst_upside is no longer a literal
+        "target price vs current price" percentage (that data isn't
+        available for free anywhere) — it's now a consensus-derived
+        proxy on a comparable scale, computed from the real buy/hold/sell
+        distribution rather than a fabricated number. short_interest_pct
+        stays 0.0 / neutral, same as the pre-existing "no data" branch
+        below already handled when yfinance had nothing either."""
         now = datetime.utcnow()
         if ticker in self._fundamental_cache:
             cached, fetched_at = self._fundamental_cache[ticker]
@@ -1327,17 +1353,47 @@ class MCPStockAgent:
         result = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
                   'analyst_count': 0,    'fundamental_score': 0.5}
         try:
-            import yfinance as yf
-            info = yf.Ticker(ticker).info
-            target      = float(info.get('targetMeanPrice') or 0)
-            n_analysts  = int(info.get('numberOfAnalystOpinions') or 0)
-            short_float = float(info.get('shortPercentOfFloat') or 0)
+            import requests
+            api_key = os.environ.get('FINNHUB_API_KEY', '')
+            if not api_key:
+                raise RuntimeError("Finnhub API key not configured")
+            resp = requests.get(
+                "https://finnhub.io/api/v1/stock/recommendation",
+                params={"symbol": ticker, "token": api_key},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            periods = resp.json() or []
+            short_float = 0.0  # not available free on any tested tier
 
-            upside = ((target - price) / price * 100) if target > 0 and price > 0 else 0.0
+            if periods:
+                latest = periods[0]  # API returns most-recent period first
+                strong_buy = int(latest.get('strongBuy') or 0)
+                buy = int(latest.get('buy') or 0)
+                hold = int(latest.get('hold') or 0)
+                sell = int(latest.get('sell') or 0)
+                strong_sell = int(latest.get('strongSell') or 0)
+                n_analysts = strong_buy + buy + hold + sell + strong_sell
 
-            # upside score: 0%→0.3, 10%→0.6, 25%+→1.0
+                if n_analysts > 0:
+                    # Per-analyst-weighted sentiment: +2/+1/0/-1/-2, normalized
+                    # to [-1, 1] by the maximum possible weight (unanimous
+                    # strongBuy or strongSell).
+                    consensus = (2 * strong_buy + buy - sell - 2 * strong_sell) / (2 * n_analysts)
+                    # Mapped onto the same rough magnitude range real analyst
+                    # upside percentages tend to fall in (-25% to +25%) so
+                    # this reads comparably to the old field, while being
+                    # honestly consensus-derived rather than a price target.
+                    upside = round(consensus * 25, 1)
+                else:
+                    upside = 0.0
+            else:
+                n_analysts = 0
+                upside = 0.0
+
+            # upside score: same shape as before — 0%→0.3, 10%→0.6, 25%+→1.0
             upside_score = min(1.0, max(0.0, 0.3 + upside / 35.0))
-            # short squeeze score: >15% float short with positive catalyst → bullish
+            # short squeeze score: neutral default — no free short-interest source
             short_score = min(1.0, short_float / 0.15) if short_float > 0 else 0.3
 
             # Only trust consensus if ≥3 analysts cover the stock
@@ -1347,7 +1403,7 @@ class MCPStockAgent:
                 fund_score = 0.5  # neutral when no coverage
 
             result = {
-                'analyst_upside':    round(upside, 1),
+                'analyst_upside':    upside,
                 'short_interest_pct': round(short_float * 100, 1),
                 'analyst_count':     n_analysts,
                 'fundamental_score': fund_score,
