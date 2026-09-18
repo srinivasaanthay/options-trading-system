@@ -9,6 +9,9 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
+from collections import deque
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -26,6 +29,38 @@ from analyzer.reasoning_generator import ReasoningGenerator
 
 
 logger = logging.getLogger(__name__)
+
+
+class _RateLimiter:
+    """Thread-safe sliding-window rate limiter — blocks the calling thread
+    until a call is allowed, rather than firing and letting the API reject
+    it. Needed because Finnhub's free-tier cap (60/min) applies per API key
+    across ALL endpoints combined, and the scan's 16-way thread pool would
+    otherwise burst far past that in the same second (confirmed directly:
+    a 16-way parallel test against /stock/recommendation got only 12/50
+    calls through, the rest 429'd). Capped at 50, not 60, to leave headroom
+    for app.py's separate top-20 display-fundamentals calls sharing the
+    same Finnhub key."""
+    def __init__(self, max_calls: int, period_seconds: float):
+        self._max_calls = max_calls
+        self._period = period_seconds
+        self._calls = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._calls and now - self._calls[0] > self._period:
+                    self._calls.popleft()
+                if len(self._calls) < self._max_calls:
+                    self._calls.append(now)
+                    return
+                wait = self._period - (now - self._calls[0])
+            time.sleep(max(0.05, wait))
+
+
+finnhub_limiter = _RateLimiter(max_calls=50, period_seconds=60.0)
 
 
 class BuySignal(Enum):
@@ -229,7 +264,8 @@ class MCPStockAgent:
     async def analyze_ticker(
         self,
         ticker: str,
-        price: float
+        price: float,
+        use_finnhub: bool = True
     ) -> AnalysisResult:
         """
         Analyze a ticker and generate buy signal
@@ -237,6 +273,17 @@ class MCPStockAgent:
         Args:
             ticker: Stock ticker symbol
             price: Current stock price
+            use_finnhub: When False, skip the Finnhub-backed earnings-date
+                and analyst-consensus calls entirely and use their neutral
+                defaults (999 days / 0.0 upside / 0.5 fundamental_score) —
+                the same values these calls already fall back to on
+                failure. Exists so app.py's scan can do a cheap first pass
+                over every candidate (Alpaca + technical + news only) and
+                spend Finnhub's free-tier rate budget (60 calls/min) only
+                on the top-ranked candidates in a second pass, rather than
+                bursting ~3,000 calls at it for a ~1,600-ticker universe
+                and having nearly all of them 429 (confirmed directly: a
+                16-way parallel burst got only 12/50 calls through).
 
         Returns:
             AnalysisResult with comprehensive analysis
@@ -249,8 +296,13 @@ class MCPStockAgent:
             technical_data = self._fetch_real_technical_data(ticker, price)
             options_data   = self._fetch_real_options_data(ticker, price)
             market_data    = self._fetch_real_market_data()
-            fundamental    = self._fetch_real_fundamental_data(ticker, price)
-            days_to_earn   = self._fetch_earnings_date(ticker)
+            if use_finnhub:
+                fundamental    = self._fetch_real_fundamental_data(ticker, price)
+                days_to_earn   = self._fetch_earnings_date(ticker)
+            else:
+                fundamental    = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
+                                   'analyst_count': 0,    'fundamental_score': 0.5}
+                days_to_earn   = 999
 
             # Run all analyzers
             # news_data and technical_data are pre-formatted simulation dicts;
@@ -1300,6 +1352,9 @@ class MCPStockAgent:
             if (now - fetched_at).total_seconds() < 86400:
                 return cached_days
         days = 999
+        success = False  # only cache on real success — a 429/timeout must
+        # not lock a ticker at the default for the full 24h TTL, or a
+        # single rate-limited moment "poisons" it for the rest of the day.
         try:
             import requests
             from datetime import date as _date, timedelta as _timedelta
@@ -1307,6 +1362,7 @@ class MCPStockAgent:
             if not api_key:
                 raise RuntimeError("Finnhub API key not configured")
             today = _date.today()
+            finnhub_limiter.acquire()
             resp = requests.get(
                 "https://finnhub.io/api/v1/calendar/earnings",
                 params={
@@ -1323,9 +1379,11 @@ class MCPStockAgent:
                 # Events come back sorted by date already; take the soonest.
                 earn_date = _date.fromisoformat(events[0]["date"])
                 days = max(0, (earn_date - today).days)
+            success = True
         except Exception as e:
             logger.debug(f"[Earnings] {ticker} Finnhub fetch failed: {e}")
-        self._earnings_cache[ticker] = (days, now)
+        if success:
+            self._earnings_cache[ticker] = (days, now)
         return days
 
     def _fetch_real_fundamental_data(self, ticker: str, price: float) -> Dict:
@@ -1352,11 +1410,13 @@ class MCPStockAgent:
 
         result = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
                   'analyst_count': 0,    'fundamental_score': 0.5}
+        success = False  # only cache on real success — see _fetch_earnings_date
         try:
             import requests
             api_key = os.environ.get('FINNHUB_API_KEY', '')
             if not api_key:
                 raise RuntimeError("Finnhub API key not configured")
+            finnhub_limiter.acquire()
             resp = requests.get(
                 "https://finnhub.io/api/v1/stock/recommendation",
                 params={"symbol": ticker, "token": api_key},
@@ -1408,10 +1468,12 @@ class MCPStockAgent:
                 'analyst_count':     n_analysts,
                 'fundamental_score': fund_score,
             }
+            success = True
         except Exception as e:
             logger.debug("[Fundamentals] %s failed: %s", ticker, e)
 
-        self._fundamental_cache[ticker] = (result, now)
+        if success:
+            self._fundamental_cache[ticker] = (result, now)
         return result
 
     # -----------------------------------------------------------------------

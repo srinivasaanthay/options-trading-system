@@ -1869,10 +1869,10 @@ ANALYZE_CONCURRENCY = 16
 _ANALYZE_EXECUTOR = ThreadPoolExecutor(max_workers=ANALYZE_CONCURRENCY, thread_name_prefix="analyze")
 
 
-def _analyze_ticker_sync(ticker: str, price: float):
+def _analyze_ticker_sync(ticker: str, price: float, use_finnhub: bool = True):
     """Thread-pool entry point — analyze_ticker has no internal awaits, so a
     fresh event loop per call is cheap and safe (no other loop touches this thread)."""
-    return asyncio.run(stock_agent.analyze_ticker(ticker, price))
+    return asyncio.run(stock_agent.analyze_ticker(ticker, price, use_finnhub=use_finnhub))
 
 
 async def _analyze_sp500_options() -> List[OptionsRecommendation]:
@@ -1996,50 +1996,88 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
         candidates.append((ticker, float(price)))
 
     # Pass 2 — the expensive part, run concurrently across a thread pool.
-    async def _analyze_one(ticker: str, price: float):
+    # Two-tier: tier 1 is Alpaca+technical+news only (use_finnhub=False,
+    # neutral earnings/analyst defaults) for every candidate — cheap, no
+    # Finnhub rate-limit exposure. Finnhub's free tier (60 calls/min) can't
+    # cover a ~1,600-ticker universe needing 2 calls each per scan (a
+    # direct 16-way-parallel test against it got only 12/50 calls through,
+    # rest 429'd) — so real earnings/analyst data is only fetched in tier 2
+    # for the top-ranked candidates from tier 1's preliminary scoring.
+    async def _analyze_one(ticker: str, price: float, use_finnhub: bool):
         try:
-            result = await loop.run_in_executor(_ANALYZE_EXECUTOR, _analyze_ticker_sync, ticker, price)
+            result = await loop.run_in_executor(
+                _ANALYZE_EXECUTOR, _analyze_ticker_sync, ticker, price, use_finnhub)
             return ticker, price, result, None
         except Exception as e:
             return ticker, price, None, e
 
-    analyzed = await asyncio.gather(*[_analyze_one(t, p) for t, p in candidates])
+    analyzed = await asyncio.gather(*[_analyze_one(t, p, False) for t, p in candidates])
 
-    # Pass 3 — cheap, in-memory scoring/filtering over the results, sequential.
-    for idx, (ticker, price, result, err) in enumerate(analyzed, 1):
-        if err is not None:
-            logger.debug(f"[SP500] {ticker} skipped: {err}")
-            continue
-        try:
-            # Skip if earnings are ≤3 days away — IV crush kills option buyers
-            if result.days_to_earnings <= 3:
-                logger.debug("[SP500] %s skipped — earnings in %d days",
-                             ticker, result.days_to_earnings)
+    # Pass 3 — cheap, in-memory scoring/filtering over analyzed results.
+    # Reused for both tiers: tier 1 uses this to rank candidates (with
+    # earnings/analyst still at neutral defaults, so the earnings gate
+    # below is a no-op there); tier 2 re-runs it over the enriched
+    # top-N results, where the earnings gate can now actually fire on
+    # real data.
+    def _score_pass(analyzed_list):
+        out: Dict[str, OptionsRecommendation] = {}
+        for idx, (ticker, price, result, err) in enumerate(analyzed_list, 1):
+            if err is not None:
+                logger.debug(f"[SP500] {ticker} skipped: {err}")
                 continue
+            try:
+                # Skip if earnings are ≤3 days away — IV crush kills option buyers
+                if result.days_to_earnings <= 3:
+                    logger.debug("[SP500] %s skipped — earnings in %d days",
+                                 ticker, result.days_to_earnings)
+                    continue
 
-            # Include bullish (CALL, tech >= 0.55) and bearish (PUT, tech <= 0.45)
-            is_bullish = result.technical_score >= 0.55
-            is_bearish = result.technical_score <= 0.45
-            if is_bullish or is_bearish:
-                t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
-                # Matches _make_options_rec's own internal is_bearish check —
-                # never disagrees in practice since that check's 0.48 cutoff
-                # sits strictly between this gate's 0.55/0.45 thresholds.
-                action = "PUT" if is_bearish else "CALL"
-                rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
-                                         prev_close=prev_close_map.get(ticker),
-                                         precomputed_candle=candles.get(ticker),
-                                         precomputed_fade_streak=fade_streaks.get(ticker),
-                                         precomputed_first_seen=first_seen_map.get((ticker, action)))
-                if rec.score >= 0.55:  # minimum signal strength
-                    recs.append(rec)
+                # Include bullish (CALL, tech >= 0.55) and bearish (PUT, tech <= 0.45)
+                is_bullish = result.technical_score >= 0.55
+                is_bearish = result.technical_score <= 0.45
+                if is_bullish or is_bearish:
+                    t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
+                    # Matches _make_options_rec's own internal is_bearish check —
+                    # never disagrees in practice since that check's 0.48 cutoff
+                    # sits strictly between this gate's 0.55/0.45 thresholds.
+                    action = "PUT" if is_bearish else "CALL"
+                    rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
+                                             prev_close=prev_close_map.get(ticker),
+                                             precomputed_candle=candles.get(ticker),
+                                             precomputed_fade_streak=fade_streaks.get(ticker),
+                                             precomputed_first_seen=first_seen_map.get((ticker, action)))
+                    if rec.score >= 0.55:  # minimum signal strength
+                        out[ticker] = rec
 
-            if idx % 100 == 0:
-                logger.info(f"[SP500] Progress {idx}/{len(analyzed)}")
+                if idx % 100 == 0:
+                    logger.info(f"[SP500] Progress {idx}/{len(analyzed_list)}")
+            except Exception as e:
+                logger.debug(f"[SP500] {ticker} skipped: {e}")
+        return out
 
-        except Exception as e:
-            logger.debug(f"[SP500] {ticker} skipped: {e}")
-            continue
+    prelim = _score_pass(analyzed)
+
+    # Tier 2 — spend Finnhub's rate-limited budget only on the strongest
+    # candidates. Reuses tier 1's warm per-ticker caches (5-min options
+    # cache, prefetched OHLCV/technical/news) so this second pass only adds
+    # the incremental Finnhub network calls, not a full re-fetch.
+    FINNHUB_TOP_N = 150
+    top_tickers = sorted(prelim.values(), key=lambda r: r.score, reverse=True)[:FINNHUB_TOP_N]
+    top_ticker_set = {r.ticker for r in top_tickers}
+    enrich_candidates = [(t, p) for t, p in candidates if t in top_ticker_set]
+    analyzed_enriched = await asyncio.gather(*[_analyze_one(t, p, True) for t, p in enrich_candidates])
+    enriched = _score_pass(analyzed_enriched)
+
+    # Merge: enriched (real earnings/analyst data) results replace their
+    # tier-1 counterparts. A top-N ticker can also be correctly DROPPED
+    # here if real data shows earnings ≤3 days away or the real score
+    # falls below 0.55 — protection tier 1 could never apply, since it
+    # only ever saw the neutral 999/0.0 defaults.
+    final_map = dict(prelim)
+    final_map.update(enriched)
+    for t in top_ticker_set - set(enriched.keys()):
+        final_map.pop(t, None)
+    recs.extend(final_map.values())
 
     # Sort by score descending, keep top 100
     recs.sort(key=lambda r: r.score, reverse=True)
