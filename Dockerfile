@@ -11,7 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY analyzer/ ./analyzer/
 COPY app.py .
-COPY paper_trading_service.py .
 COPY mcp_stock_agent.py .
 COPY notification_manager.py .
 COPY sp500_tickers_500.py .
@@ -22,7 +21,6 @@ COPY logger.py .
 COPY helpers.py .
 COPY validators.py .
 COPY dynamic_tickers.py .
-COPY stock_trading_service.py .
 COPY run.py .
 COPY start.sh .
 RUN chmod +x start.sh
