@@ -57,13 +57,14 @@ from analyzer.reasoning_generator import ReasoningGenerator
 # Import agent and notifications
 from mcp_stock_agent import MCPStockAgent, BuySignal, ConfidenceLevel
 from notification_manager import NotificationManager
-from paper_trading_service import PaperTradingService
-from stock_trading_service import StockTradingService
 import dynamic_tickers
 
 logger = logging.getLogger(__name__)
 
-# Paper trading — loaded from alpaca.env file (or env vars as fallback)
+# Alpaca credentials — used for options/market data (contracts, quotes,
+# snapshots), loaded from alpaca.env file (or env vars as fallback). No
+# trading happens against these; this backend never executes real or
+# simulated trades.
 def _load_alpaca_keys() -> tuple:
     """Read ALPACA_API_KEY and ALPACA_API_SECRET from alpaca.env, then env vars."""
     env_file = os.path.join(os.path.dirname(__file__), "alpaca.env")
@@ -79,8 +80,6 @@ def _load_alpaca_keys() -> tuple:
     return os.environ.get("ALPACA_API_KEY", ""), os.environ.get("ALPACA_API_SECRET", "")
 
 _ALPACA_KEY, _ALPACA_SECRET = _load_alpaca_keys()
-paper_trader: Optional[PaperTradingService] = None
-stock_trader: Optional[StockTradingService] = None
 
 _ET = ZoneInfo("America/New_York")
 
@@ -261,8 +260,8 @@ def _interpret_composite_score(score: float) -> Tuple[str, str]:
 
 MIN_OPEN_INTEREST = 1000  # below this, contracts are too thin to trade reliably (wide spreads, bad fills)
 
-_liquidity_client = None  # lazy, cached Alpaca TradingClient — independent of paper_trader,
-                           # which local_runner.py's process never initializes
+_liquidity_client = None  # lazy, cached Alpaca TradingClient — used only for
+                           # options-contract/liquidity lookups, not trading
 
 
 def _get_liquidity_client():
@@ -2182,18 +2181,6 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
             _last_snapshot_hour = current_hour
             logger.info("[SP500] Hourly snapshot saved for %s", snapshot["hour_label"])
 
-    # Auto-execute paper trades only during optimal trading window (10:00–15:30 ET)
-    if paper_trader and paper_trader.connected:
-        if _is_market_open():
-            rec_dicts = [asdict(r) for r in latest_options_recs]
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, paper_trader.execute_signals, rec_dicts)
-            logger.info("[SP500] Paper trades executed during market hours")
-        else:
-            now_et = datetime.now(_ET)
-            logger.info("[SP500] Market closed (%s ET) — skipping trade execution",
-                        now_et.strftime("%H:%M %Z"))
-
     return latest_options_recs
 
 
@@ -2209,11 +2196,9 @@ async def _sp500_scheduler_loop():
     """Background loop replacing local_runner.py — runs the full SP500 scan
     directly on Railway instead of relying on a push from the Mac. Mirrors
     local_runner's market-hours gating (9:25 AM-4:05 PM ET weekdays, first
-    scan waits for 9:31 options open) and the stale-position cleanup +
-    stock-trade execution it used to trigger via HTTP self-calls — done as
-    direct in-process calls here since this now runs in the same process.
-    _analyze_sp500_options() already executes paper (options) trades
-    internally; stock trading does not, so it's triggered explicitly below."""
+    scan waits for 9:31 options open). Read-only — no trade execution of
+    any kind happens from this backend, paper or real; it only produces
+    signals."""
     await asyncio.sleep(30)  # let server come up healthy first
     first_scan_done = False
 
@@ -2233,17 +2218,6 @@ async def _sp500_scheduler_loop():
             if now_et < options_open:
                 await asyncio.sleep((options_open - now_et).total_seconds())
                 continue
-            if paper_trader and paper_trader.connected:
-                try:
-                    loop = asyncio.get_event_loop()
-                    all_positions = await loop.run_in_executor(None, paper_trader.client.get_all_positions)
-                    tracked = {t.option_symbol for t in paper_trader.trade_history if t.option_symbol}
-                    for p in all_positions:
-                        if p.symbol not in tracked:
-                            await loop.run_in_executor(None, paper_trader.client.close_position, p.symbol)
-                            logger.info("[Scheduler] Closed stale position %s", p.symbol)
-                except Exception as e:
-                    logger.warning(f"[Scheduler] close-stale failed: {e}")
             first_scan_done = True
 
         try:
@@ -2260,7 +2234,7 @@ async def _sp500_scheduler_loop():
             # zero signals shown) despite the scan itself working fine. 240s
             # leaves real headroom over the observed worst case while still
             # catching genuine multi-hour hangs.
-            recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=240)  # also executes paper trades internally
+            recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=240)
 
             # Push to all connected WebSocket clients
             if options_ws_connections and recs:
@@ -2278,18 +2252,6 @@ async def _sp500_scheduler_loop():
                         dead.append(ws)
                 for ws in dead:
                     options_ws_connections.remove(ws)
-
-            # Stock trading — not handled inside _analyze_sp500_options, so
-            # trigger it explicitly the same way local_runner.py used to.
-            if stock_trader and stock_trader.connected and _is_market_open() and recs:
-                try:
-                    loop = asyncio.get_event_loop()
-                    rec_dicts = [asdict(r) for r in recs]
-                    results = await loop.run_in_executor(None, stock_trader.execute_signals, rec_dicts)
-                    if results:
-                        logger.info(f"[Scheduler] Stock trades executed: {len(results)}")
-                except Exception as e:
-                    logger.warning(f"[Scheduler] stock trade execution failed: {e}")
 
         except asyncio.TimeoutError:
             logger.error("[SP500 Scheduler] Scan cycle exceeded 90s timeout — skipping to next cycle")
@@ -2310,7 +2272,7 @@ async def lifespan(app: FastAPI):
     async def _init_all():
         global news_analyzer, technical_analyzer, options_analyzer
         global market_analyzer, strategy_selector, call_put_predictor
-        global reasoning_generator, stock_agent, notification_manager, paper_trader, stock_trader
+        global reasoning_generator, stock_agent, notification_manager
 
         logger.info("Initializing analyzers...")
         news_analyzer = NewsAnalyzer()
@@ -2334,17 +2296,6 @@ async def lifespan(app: FastAPI):
             custom_webhook=os.getenv("CUSTOM_WEBHOOK_URL")
         )
         logger.info("✅ Analyzers ready")
-
-        if _ALPACA_KEY and _ALPACA_SECRET:
-            paper_trader = PaperTradingService(_ALPACA_KEY, _ALPACA_SECRET)
-            loop = asyncio.get_event_loop()
-            ok = await loop.run_in_executor(None, paper_trader.connect)
-            logger.info("✅ Paper trader %s", "connected" if ok else "FAILED")
-
-            _stock_dry_run = os.getenv("STOCK_ORDERS_DISABLED", "false").lower() == "true"
-            stock_trader = StockTradingService(_ALPACA_KEY, _ALPACA_SECRET, dry_run=_stock_dry_run)
-            ok2 = await loop.run_in_executor(None, stock_trader.connect)
-            logger.info("✅ Stock trader %s (dry_run=%s)", "connected" if ok2 else "FAILED", _stock_dry_run)
 
         # Only run local SP500 scanner if not in push mode (Railway uses push-results endpoint)
         if not os.getenv("PUSH_MODE"):
@@ -3108,184 +3059,8 @@ async def agent_performance(credentials: HTTPAuthorizationCredentials = Depends(
 
 
 # ============================================================================
-# PAPER TRADING ENDPOINTS
+# STOCK SIGNALS ENDPOINT (read-only — no trading happens from this backend)
 # ============================================================================
-
-def _require_paper_trader(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not paper_trader:
-        raise HTTPException(
-            status_code=503,
-            detail="Paper trading not initialised. Set ALPACA_API_KEY + ALPACA_API_SECRET env vars and restart."
-        )
-    if not paper_trader.connected:
-        raise HTTPException(status_code=503, detail="Paper trader is not connected to Alpaca")
-    return paper_trader
-
-
-@app.get("/api/v1/paper-trading/portfolio")
-async def get_paper_portfolio(pt: PaperTradingService = Depends(_require_paper_trader)):
-    """Current paper trading portfolio: account balance, open positions, P&L."""
-    loop = asyncio.get_event_loop()
-    snapshot = await loop.run_in_executor(None, pt.get_portfolio_snapshot)
-    positions = await loop.run_in_executor(None, pt.get_positions)
-    return {
-        "portfolio": asdict(snapshot),
-        "positions": positions,
-    }
-
-
-@app.get("/api/v1/paper-trading/trades")
-async def get_paper_trades(pt: PaperTradingService = Depends(_require_paper_trader)):
-    """Full trade history — open and closed positions."""
-    return {
-        "trades": pt.get_trade_history(),
-        "total": len(pt.trade_history),
-    }
-
-
-@app.get("/api/v1/paper-trading/performance")
-async def get_paper_performance(pt: PaperTradingService = Depends(_require_paper_trader)):
-    """Performance summary: win rate, P&L, return vs $1000 start."""
-    loop = asyncio.get_event_loop()
-    snapshot = await loop.run_in_executor(None, pt.get_portfolio_snapshot)
-    realized = await loop.run_in_executor(None, pt.get_realized_stats)
-    closed = realized["closed_trades"]
-
-    # Break down by option type (reconstructed from Alpaca's own order history,
-    # not pt.trade_history — that resets on every process restart)
-    long_trades  = [t for t in closed if t["type"] == "call"]
-    short_trades = [t for t in closed if t["type"] == "put"]
-
-    def stats(trades):
-        if not trades:
-            return {"count": 0, "wins": 0, "losses": 0, "win_rate": 0, "total_pnl": 0, "avg_pnl": 0}
-        wins = [t for t in trades if t["pnl"] > 0]
-        return {
-            "count":     len(trades),
-            "wins":      len(wins),
-            "losses":    len(trades) - len(wins),
-            "win_rate":  round(len(wins) / len(trades) * 100, 1),
-            "total_pnl": round(sum(t["pnl"] for t in trades), 2),
-            "avg_pnl":   round(sum(t["pnl"] for t in trades) / len(trades), 2),
-        }
-
-    return {
-        "summary":      asdict(snapshot),
-        "call_signals": stats(long_trades),
-        "put_signals":  stats(short_trades),
-        "orders":       await asyncio.get_event_loop().run_in_executor(None, pt.get_recent_orders, 10),
-    }
-
-
-@app.post("/api/v1/paper-trading/execute-now")
-async def execute_paper_trades_now(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    pt: PaperTradingService = Depends(_require_paper_trader)
-):
-    """Manually trigger paper trades from the latest SP500 recommendations."""
-    if not _is_market_open():
-        now_et = datetime.now(_ET)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Market is closed ({now_et.strftime('%H:%M %Z')}). Trading only allowed 9:30–16:00 ET Mon–Fri."
-        )
-    if not latest_options_recs:
-        raise HTTPException(status_code=404, detail="No SP500 recommendations available yet")
-    rec_dicts = [asdict(r) for r in latest_options_recs]
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, pt.execute_signals, rec_dicts)
-    return {"executed": len(results), "trades": results}
-
-
-@app.post("/api/v1/paper-trading/close-all")
-async def close_all_paper_positions(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    pt: PaperTradingService = Depends(_require_paper_trader)
-):
-    """Close all open positions immediately — closes options individually since Alpaca bulk-close skips them."""
-    try:
-        loop = asyncio.get_event_loop()
-        closed = await loop.run_in_executor(None, pt.close_all_open_positions)
-        return {"status": "all positions closed", "closed": closed}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/v1/paper-trading/close-stale")
-async def close_stale_positions(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    pt: PaperTradingService = Depends(_require_paper_trader)
-):
-    """Close positions held from a previous session (no entry in current trade_history)."""
-    try:
-        loop = asyncio.get_event_loop()
-        all_positions = await loop.run_in_executor(None, pt.client.get_all_positions)
-        tracked = {t.option_symbol for t in pt.trade_history if t.option_symbol}
-        closed, skipped = [], []
-        for p in all_positions:
-            if p.symbol not in tracked:
-                try:
-                    await loop.run_in_executor(None, pt.client.close_position, p.symbol)
-                    closed.append(p.symbol)
-                    logger.info("[PaperTrading] Closed stale position %s", p.symbol)
-                except Exception as e:
-                    skipped.append(p.symbol)
-                    logger.error("[PaperTrading] Could not close stale %s: %s", p.symbol, e)
-        return {"closed": len(closed), "symbols": closed, "skipped": skipped}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/v1/paper-trading/close-violations")
-async def close_violating_positions(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    pt: PaperTradingService = Depends(_require_paper_trader)
-):
-    """Close only positions that violated current entry rules (pre-fix, chased, out-of-window)."""
-    now_et = datetime.now(_ET)
-    market_open_et  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close_et = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-    is_weekday = now_et.weekday() < 5
-    if not (is_weekday and market_open_et <= now_et < market_close_et):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Market is closed ({now_et.strftime('%H:%M %Z')}). Can only close positions during market hours (9:30–16:00 ET Mon–Fri)."
-        )
-    loop = asyncio.get_event_loop()
-    closed = await loop.run_in_executor(None, pt.close_rule_violating_positions)
-    return {"closed": len(closed), "positions": closed}
-
-
-# ============================================================================
-# STOCK TRADING ENDPOINTS
-# ============================================================================
-
-def _require_stock_trader(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not stock_trader:
-        raise HTTPException(
-            status_code=503,
-            detail="Stock trading not initialised. Set ALPACA_API_KEY + ALPACA_API_SECRET env vars and restart."
-        )
-    if not stock_trader.connected:
-        raise HTTPException(status_code=503, detail="Stock trader is not connected to Alpaca")
-    return stock_trader
-
-
-@app.get("/api/v1/stock-trading/portfolio")
-async def get_stock_portfolio(st: StockTradingService = Depends(_require_stock_trader)):
-    """Stock trading portfolio: account snapshot, open positions, P&L."""
-    loop = asyncio.get_event_loop()
-    snapshot = await loop.run_in_executor(None, st.get_portfolio_snapshot)
-    positions = await loop.run_in_executor(None, st.get_positions)
-    return {
-        "portfolio": snapshot,
-        "positions": positions,
-    }
-
 
 @app.get("/api/v1/stock-trading/signals")
 async def get_stock_signals(
@@ -3309,20 +3084,6 @@ async def get_stock_signals(
         "count": len(recs),
         "signals": [asdict(r) for r in recs],
     }
-
-
-@app.post("/api/v1/stock-trading/close-all")
-async def close_all_stock_positions(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    st: StockTradingService = Depends(_require_stock_trader),
-):
-    """Close all open stock positions immediately."""
-    try:
-        loop = asyncio.get_event_loop()
-        closed = await loop.run_in_executor(None, st.close_all)
-        return {"status": "closed", "count": closed}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
