@@ -38,7 +38,7 @@ from fastapi import FastAPI, HTTPException, Depends, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional, Dict, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -1572,7 +1572,16 @@ def _load_results_pg() -> bool:
             except Exception:
                 continue
         latest_options_recs = recs
-        last_sp500_run = last_run.astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None)
+        # last_sp500_run is naive UTC everywhere else in this codebase (set
+        # via datetime.utcnow()) -- must convert to UTC here too, not ET.
+        # This used to convert to America/New_York and strip tzinfo,
+        # silently mislabeling an ET-valued naive datetime as if it were
+        # UTC. Every value read back after a restart was off by the
+        # UTC-ET offset (4-5h depending on DST) until the next real scan
+        # overwrote it -- confirmed directly: a status check showed
+        # last_run as "2026-09-17T21:29:33", exactly 4 hours off the real
+        # "2026-09-18T01:29:33" UTC value of that same scan.
+        last_sp500_run = last_run.astimezone(timezone.utc).replace(tzinfo=None)
         logger.info(f"[Postgres] Restored {len(recs)} recommendations from database")
         return True
     except Exception as e:
