@@ -1874,6 +1874,55 @@ def _analyze_ticker_sync(ticker: str, price: float, use_finnhub: bool = True):
     return asyncio.run(stock_agent.analyze_ticker(ticker, price, use_finnhub=use_finnhub))
 
 
+def _score_analyzed_results(
+    analyzed_list,
+    intraday_extremes_map: Dict[str, Tuple[Optional[float], Optional[float]]],
+    prev_close_map: Dict[str, float],
+    candles: Dict[str, dict],
+    fade_streaks: Dict[str, tuple],
+    first_seen_map: Dict[Tuple[str, str], Tuple[datetime, float]],
+) -> Dict[str, OptionsRecommendation]:
+    """Shared scoring/gating logic: earnings gate, bullish/bearish
+    threshold, minimum score cutoff. Used by both the full
+    _analyze_sp500_options scan and _refresh_final_tickers's fast re-score
+    loop, so the two can't silently diverge into different rules for what
+    counts as a signal."""
+    out: Dict[str, OptionsRecommendation] = {}
+    for idx, (ticker, price, result, err) in enumerate(analyzed_list, 1):
+        if err is not None:
+            logger.debug(f"[SP500] {ticker} skipped: {err}")
+            continue
+        try:
+            # Skip if earnings are ≤3 days away — IV crush kills option buyers
+            if result.days_to_earnings <= 3:
+                logger.debug("[SP500] %s skipped — earnings in %d days",
+                             ticker, result.days_to_earnings)
+                continue
+
+            # Include bullish (CALL, tech >= 0.55) and bearish (PUT, tech <= 0.45)
+            is_bullish = result.technical_score >= 0.55
+            is_bearish = result.technical_score <= 0.45
+            if is_bullish or is_bearish:
+                t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
+                # Matches _make_options_rec's own internal is_bearish check —
+                # never disagrees in practice since that check's 0.48 cutoff
+                # sits strictly between this gate's 0.55/0.45 thresholds.
+                action = "PUT" if is_bearish else "CALL"
+                rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
+                                         prev_close=prev_close_map.get(ticker),
+                                         precomputed_candle=candles.get(ticker),
+                                         precomputed_fade_streak=fade_streaks.get(ticker),
+                                         precomputed_first_seen=first_seen_map.get((ticker, action)))
+                if rec.score >= 0.55:  # minimum signal strength
+                    out[ticker] = rec
+
+            if idx % 100 == 0:
+                logger.info(f"[SP500] Progress {idx}/{len(analyzed_list)}")
+        except Exception as e:
+            logger.debug(f"[SP500] {ticker} skipped: {e}")
+    return out
+
+
 async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     """Analyze top 500 liquid US stocks, return top options recommendations."""
     global latest_options_recs, last_sp500_run
@@ -2023,44 +2072,11 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # Pass 3 — cheap, in-memory scoring/filtering over analyzed results.
     # Reused for both tiers: tier 1 uses this to rank candidates (with
     # earnings/analyst still at neutral defaults, so the earnings gate
-    # below is a no-op there); tier 2 re-runs it over the enriched
-    # top-N results, where the earnings gate can now actually fire on
-    # real data.
+    # is a no-op there); tier 2 re-runs it over the enriched top-N
+    # results, where the earnings gate can now actually fire on real data.
     def _score_pass(analyzed_list):
-        out: Dict[str, OptionsRecommendation] = {}
-        for idx, (ticker, price, result, err) in enumerate(analyzed_list, 1):
-            if err is not None:
-                logger.debug(f"[SP500] {ticker} skipped: {err}")
-                continue
-            try:
-                # Skip if earnings are ≤3 days away — IV crush kills option buyers
-                if result.days_to_earnings <= 3:
-                    logger.debug("[SP500] %s skipped — earnings in %d days",
-                                 ticker, result.days_to_earnings)
-                    continue
-
-                # Include bullish (CALL, tech >= 0.55) and bearish (PUT, tech <= 0.45)
-                is_bullish = result.technical_score >= 0.55
-                is_bearish = result.technical_score <= 0.45
-                if is_bullish or is_bearish:
-                    t_high, t_low = intraday_extremes_map.get(ticker, (None, None))
-                    # Matches _make_options_rec's own internal is_bearish check —
-                    # never disagrees in practice since that check's 0.48 cutoff
-                    # sits strictly between this gate's 0.55/0.45 thresholds.
-                    action = "PUT" if is_bearish else "CALL"
-                    rec = _make_options_rec(ticker, result, price, today_high=t_high, today_low=t_low,
-                                             prev_close=prev_close_map.get(ticker),
-                                             precomputed_candle=candles.get(ticker),
-                                             precomputed_fade_streak=fade_streaks.get(ticker),
-                                             precomputed_first_seen=first_seen_map.get((ticker, action)))
-                    if rec.score >= 0.55:  # minimum signal strength
-                        out[ticker] = rec
-
-                if idx % 100 == 0:
-                    logger.info(f"[SP500] Progress {idx}/{len(analyzed_list)}")
-            except Exception as e:
-                logger.debug(f"[SP500] {ticker} skipped: {e}")
-        return out
+        return _score_analyzed_results(analyzed_list, intraday_extremes_map, prev_close_map,
+                                        candles, fade_streaks, first_seen_map)
 
     prelim = _score_pass(analyzed)
 
@@ -2184,12 +2200,145 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     return latest_options_recs
 
 
-SP500_SCAN_INTERVAL = 60  # cooldown after each scan finishes, not a fixed
-# clock tick — the loop is sequential (scan, then sleep, then scan again),
-# so this never overlaps a running scan. Lowered from 2 min once the
-# options-fetch batching fix (see prefetch_options_data) cut scan time
+async def _refresh_final_tickers() -> List[OptionsRecommendation]:
+    """Fast re-score of just the current final signals (~30 tickers, not
+    the full ~1,660-ticker universe), run every REFRESH_INTERVAL seconds
+    during the cooldown between full scans (see _sp500_scheduler_loop) so
+    displayed data stays close to real-time instead of only updating once
+    per full scan. Mirrors _analyze_sp500_options's per-ticker pipeline
+    (price, OHLCV, options, Finnhub, scoring) exactly — via the same
+    _score_analyzed_results function — just scoped to a small ticker set,
+    so it completes in a few seconds instead of minutes.
+
+    Score/action CAN change here: a signal can flip CALL<->PUT or drop
+    below the 0.55 threshold between full scans, and the refreshed list
+    entirely replaces latest_options_recs (not merged with it) — same
+    "full re-score" semantics as a real scan, just scoped down. This
+    backend doesn't execute trades of any kind, so a flip here is a
+    display-only concern, not a risk one.
+
+    Does NOT call _save_scan_history_pg() — that inserts one row per rec
+    per call, and running it every ~15-20s instead of every ~3.5 min would
+    multiply scan_history's write volume ~10x and blur its "one row-set
+    per scan cycle" semantics that other tooling (e.g. the local
+    prediction tracker) relies on. _save_results() (a single-row upsert)
+    still runs, so a mid-cooldown restart doesn't lose the latest refresh.
+    Also does not touch last_sp500_run — that timestamp marks full-scan
+    completions specifically; freshness from this loop shows up via
+    latest_options_recs's own content instead."""
+    global latest_options_recs
+
+    if not latest_options_recs:
+        return latest_options_recs
+
+    tickers = [r.ticker for r in latest_options_recs]
+    loop = asyncio.get_event_loop()
+
+    price_map = await loop.run_in_executor(None, _fetch_prices_batch, tickers)
+    prev_close_map = await loop.run_in_executor(None, _fetch_prev_closes_batch, tickers)
+    intraday_extremes_map = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, tickers)
+    first_seen_map = await loop.run_in_executor(None, _fetch_signal_first_seen)
+    prefetch_list = tickers if 'SPY' in tickers else tickers + ['SPY']
+    await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, prefetch_list)
+    await loop.run_in_executor(None, _prefetch_hourly_ohlcv, tickers)
+
+    candles: Dict[str, dict] = {}
+    fade_streaks: Dict[str, tuple] = {}
+    candidates: List[Tuple[str, float]] = []
+    for ticker in tickers:
+        if ticker not in stock_agent._ohlcv_cache:
+            continue
+        candles[ticker] = _detect_candle_pattern(_hourly_ohlcv_cache.get(ticker))
+        fade_streaks[ticker] = (
+            _detect_fade_streak(stock_agent._ohlcv_cache[ticker], is_bearish=False),
+            _detect_fade_streak(stock_agent._ohlcv_cache[ticker], is_bearish=True),
+        )
+        price = price_map.get(ticker) or _fallback_price(ticker)
+        if not price or price <= 0:
+            continue
+        today_high, today_low = intraday_extremes_map.get(ticker, (None, None))
+        if not _is_price_plausible(price, today_low, today_high):
+            logger.warning("[Refresh] %s skipped — price $%.2f outside today's own range $%.2f-$%.2f (bad fetch)",
+                            ticker, price, today_low or 0.0, today_high or 0.0)
+            continue
+        candidates.append((ticker, float(price)))
+
+    if not candidates:
+        return latest_options_recs
+
+    await loop.run_in_executor(None, stock_agent.prefetch_options_data, candidates)
+
+    async def _analyze_one(ticker: str, price: float):
+        try:
+            result = await loop.run_in_executor(
+                _ANALYZE_EXECUTOR, _analyze_ticker_sync, ticker, price, True)
+            return ticker, price, result, None
+        except Exception as e:
+            return ticker, price, None, e
+
+    analyzed = await asyncio.gather(*[_analyze_one(t, p) for t, p in candidates])
+    scored = _score_analyzed_results(analyzed, intraday_extremes_map, prev_close_map,
+                                      candles, fade_streaks, first_seen_map)
+
+    recs = sorted(scored.values(), key=lambda r: r.score, reverse=True)
+
+    liquid_recs = []
+    for rec in recs:
+        oi = _check_open_interest(rec.ticker, rec.strike_price, rec.expiry_date, rec.action)
+        if oi is None or oi >= MIN_OPEN_INTEREST:
+            liquid_recs.append(rec)
+        else:
+            logger.debug(f"[Refresh] Dropping {rec.ticker} — OI {oi} < {MIN_OPEN_INTEREST}")
+    recs = liquid_recs
+
+    for rec in recs[:20]:
+        rec.news_headlines = _fetch_ticker_news(rec.ticker)
+        rec.fundamentals   = _fetch_fundamentals(rec.ticker)
+        age_days, pct_change = _compute_catalyst_freshness(rec.ticker, rec.news_headlines, rec.current_price)
+        rec.catalyst_age_days = age_days if age_days is not None else -1
+        rec.price_change_since_catalyst = pct_change if pct_change is not None else 0.0
+        rec.thesis = _append_catalyst_narrative(rec.thesis, rec.ticker, rec.catalyst_age_days, rec.price_change_since_catalyst)
+        rec.key_factors, rec.risks = _generate_key_factors_and_risks(rec)
+
+    latest_options_recs = recs
+    _save_results()
+    logger.info(f"[Refresh] Re-scored {len(candidates)}/{len(tickers)} final tickers — {len(recs)} still clear the bar")
+    return recs
+
+
+SP500_SCAN_INTERVAL = 60  # cooldown after each full scan finishes, not a
+# fixed clock tick — the loop is sequential (scan, then cooldown, then scan
+# again), so this never overlaps a running scan. Lowered from 2 min once
+# the options-fetch batching fix (see prefetch_options_data) cut scan time
 # from 7.5-8.5 min back down to ~2.5 min; real cadence is scan time + this
 # value, not this value alone.
+
+REFRESH_INTERVAL = 15  # during SP500_SCAN_INTERVAL's cooldown, re-score just
+# the current final tickers this often (see _refresh_final_tickers) so
+# displayed data stays close to real-time between full scans, not just
+# updating once every ~3.5 min.
+
+
+async def _push_options_update(recs: List[OptionsRecommendation], event: str) -> None:
+    """Push a recommendations payload to all connected WebSocket clients —
+    shared by the full scan and the fast refresh loop so both update
+    subscribers the same way."""
+    if not (options_ws_connections and recs):
+        return
+    payload = [asdict(r) for r in recs]
+    dead = []
+    for ws in list(options_ws_connections):
+        try:
+            await ws.send_json({
+                "event": event,
+                "timestamp": datetime.utcnow().isoformat(),
+                "count": len(payload),
+                "recommendations": payload,
+            })
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        options_ws_connections.remove(ws)
 
 
 async def _sp500_scheduler_loop():
@@ -2235,30 +2384,28 @@ async def _sp500_scheduler_loop():
             # leaves real headroom over the observed worst case while still
             # catching genuine multi-hour hangs.
             recs = await asyncio.wait_for(_analyze_sp500_options(), timeout=240)
-
-            # Push to all connected WebSocket clients
-            if options_ws_connections and recs:
-                payload = [asdict(r) for r in recs]
-                dead = []
-                for ws in list(options_ws_connections):
-                    try:
-                        await ws.send_json({
-                            "event": "sp500_options_update",
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "count": len(payload),
-                            "recommendations": payload,
-                        })
-                    except Exception:
-                        dead.append(ws)
-                for ws in dead:
-                    options_ws_connections.remove(ws)
+            await _push_options_update(recs, "sp500_options_update")
 
         except asyncio.TimeoutError:
             logger.error("[SP500 Scheduler] Scan cycle exceeded 90s timeout — skipping to next cycle")
         except Exception as e:
             logger.error(f"[SP500 Scheduler] Error: {e}")
 
-        await asyncio.sleep(SP500_SCAN_INTERVAL)
+        # Cooldown before the next full scan — broken into short sub-cycles
+        # that each re-score just the current final tickers (see
+        # _refresh_final_tickers) so the displayed data keeps moving in
+        # near-real-time through the whole cooldown, not just at the start.
+        num_refreshes = max(1, SP500_SCAN_INTERVAL // REFRESH_INTERVAL)
+        for _ in range(num_refreshes):
+            await asyncio.sleep(REFRESH_INTERVAL)
+            try:
+                refreshed = await asyncio.wait_for(_refresh_final_tickers(), timeout=REFRESH_INTERVAL * 2)
+                await _push_options_update(refreshed, "sp500_options_refresh")
+            except asyncio.TimeoutError:
+                logger.warning("[Refresh] Final-ticker re-score exceeded %ss — skipping this sub-cycle",
+                                REFRESH_INTERVAL * 2)
+            except Exception as e:
+                logger.warning(f"[Refresh] Final-ticker re-score failed: {e}")
 
 
 # ============================================================================
@@ -3134,11 +3281,16 @@ async def websocket_sp500_options(websocket: WebSocket):
     """
     Real-time WebSocket for SP500 options recommendations.
 
-    Sends a snapshot immediately on connect, then pushes updates on every
-    scan cycle (~3.5 min during market hours — see SP500_SCAN_INTERVAL).
-    Each message has the structure:
+    Sends a snapshot immediately on connect, then pushes two kinds of
+    updates during market hours: a full-scan update ("sp500_options_update")
+    every ~3.5 min (see SP500_SCAN_INTERVAL), and a faster re-score update
+    ("sp500_options_refresh") of just the current final tickers every
+    REFRESH_INTERVAL seconds in between (see _refresh_final_tickers) — the
+    same shape, distinguished only by the event name, so a client that
+    doesn't care about the distinction can treat both identically. Each
+    message has the structure:
       {
-        "event": "sp500_options_update",
+        "event": "sp500_options_update" | "sp500_options_refresh",
         "timestamp": "...",
         "count": N,
         "recommendations": [ { ticker, action, strike_price, expiry_date, score, ... }, ... ]
