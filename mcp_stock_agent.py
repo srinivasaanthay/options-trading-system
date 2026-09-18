@@ -255,6 +255,17 @@ class MCPStockAgent:
         self._market_cache: Dict = {}
         self._market_cache_time: Optional[datetime] = None
         self._options_cache: Dict[str, Tuple[Dict, datetime]] = {}
+        # Shared, lazily-built Alpaca clients for _fetch_real_options_data —
+        # NOT per-call. Each Trading/OptionHistoricalDataClient constructs
+        # its own requests.Session() (confirmed by reading the SDK source),
+        # so building one per ticker meant every one of ~1,660 tickers paid
+        # a cold TCP+TLS handshake instead of reusing a warm connection —
+        # this alone stretched a scan that used to take ~150-190s out to
+        # ~6 minutes, blowing the scheduler's 240s timeout every cycle.
+        # app.py's _get_liquidity_client() already used this cached pattern;
+        # this just brings _fetch_real_options_data in line with it.
+        self._alpaca_trading_client = None
+        self._alpaca_option_data_client = None
         self._broad_news_cache: Optional[Tuple[List[Dict], datetime]] = None
         self._earnings_cache: Dict[str, Tuple[int, datetime]] = {}    # ticker → (days_to_earn, fetched_at)
         self._fundamental_cache: Dict[str, Tuple[Dict, datetime]] = {} # ticker → (data, fetched_at)
@@ -1216,8 +1227,16 @@ class MCPStockAgent:
             if not key or not secret:
                 raise RuntimeError("Alpaca credentials not configured")
 
-            trading_client = TradingClient(key, secret, paper=True)
-            data_client = OptionHistoricalDataClient(key, secret)
+            # Reused across every ticker/call — see the __init__ comment on
+            # these attributes for why building fresh clients per-call was
+            # a serious latency bug at ~1,660-ticker scale. requests.Session
+            # (which these wrap) is safe for concurrent use across threads.
+            if self._alpaca_trading_client is None:
+                self._alpaca_trading_client = TradingClient(key, secret, paper=True)
+            if self._alpaca_option_data_client is None:
+                self._alpaca_option_data_client = OptionHistoricalDataClient(key, secret)
+            trading_client = self._alpaca_trading_client
+            data_client = self._alpaca_option_data_client
 
             # ATM window: ±10% of current price, same as before. Expiry
             # window 14-45 days out — avoids 0DTE noise on one end and
