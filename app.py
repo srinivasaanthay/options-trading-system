@@ -2061,22 +2061,52 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     # candidates. Reuses tier 1's warm per-ticker caches (5-min options
     # cache, prefetched OHLCV/technical/news) so this second pass only adds
     # the incremental Finnhub network calls, not a full re-fetch.
-    FINNHUB_TOP_N = 150
+    #
+    # N and the timeout below are both sized against the scheduler's hard
+    # 240s budget for the ENTIRE scan (see the asyncio.wait_for around
+    # _analyze_sp500_options — a comment there documents this exact failure
+    # mode already happening once: repeated timeouts silently zeroing out
+    # recommendations for a whole morning). Tier 1 alone over the full
+    # ~1,600-ticker universe has been measured at 120-190s with no Finnhub
+    # calls in it at all, so tier 2 has only ~50-100s of real headroom.
+    # finnhub_limiter cap is 50/min shared — N=30 needs up to 60 calls,
+    # ~72s worst case if every single one queues for the full window,
+    # comfortably inside that headroom. wait_for is a second, independent
+    # safety net: if Finnhub is unusually slow this cycle, tier 2 gives up
+    # on its own well before the 240s deadline and falls back to tier 1's
+    # already-good (neutral-default) results, rather than risking the
+    # whole scan (including tier 1's finished work) getting killed by the
+    # outer timeout and returning zero recommendations.
+    FINNHUB_TOP_N = 30
     top_tickers = sorted(prelim.values(), key=lambda r: r.score, reverse=True)[:FINNHUB_TOP_N]
     top_ticker_set = {r.ticker for r in top_tickers}
     enrich_candidates = [(t, p) for t, p in candidates if t in top_ticker_set]
-    analyzed_enriched = await asyncio.gather(*[_analyze_one(t, p, True) for t, p in enrich_candidates])
-    enriched = _score_pass(analyzed_enriched)
+    tier2_timed_out = False
+    try:
+        analyzed_enriched = await asyncio.wait_for(
+            asyncio.gather(*[_analyze_one(t, p, True) for t, p in enrich_candidates]),
+            timeout=100,
+        )
+        enriched = _score_pass(analyzed_enriched)
+    except asyncio.TimeoutError:
+        logger.warning("[SP500] Tier-2 Finnhub enrichment exceeded 100s — "
+                        "keeping tier-1 (neutral-default) results for this cycle")
+        tier2_timed_out = True
+        enriched = {}
 
     # Merge: enriched (real earnings/analyst data) results replace their
     # tier-1 counterparts. A top-N ticker can also be correctly DROPPED
     # here if real data shows earnings ≤3 days away or the real score
     # falls below 0.55 — protection tier 1 could never apply, since it
-    # only ever saw the neutral 999/0.0 defaults.
+    # only ever saw the neutral 999/0.0 defaults. Skipped entirely on a
+    # tier-2 timeout — there the absence of a ticker from `enriched` means
+    # "didn't get to it in time", not "real data says drop it", so tier 1's
+    # result must stand instead of being deleted.
     final_map = dict(prelim)
     final_map.update(enriched)
-    for t in top_ticker_set - set(enriched.keys()):
-        final_map.pop(t, None)
+    if not tier2_timed_out:
+        for t in top_ticker_set - set(enriched.keys()):
+            final_map.pop(t, None)
     recs.extend(final_map.values())
 
     # Sort by score descending, keep top 100
