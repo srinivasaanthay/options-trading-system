@@ -1196,6 +1196,215 @@ class MCPStockAgent:
             'summary': summary,
         }
 
+    def _build_options_result(self, ticker: str, price: float, calls: List, puts: List, snaps: Dict) -> Dict:
+        """Shared scoring logic: turn a ticker's already-fetched contract
+        lists + snapshot dict into the same result shape both
+        prefetch_options_data (batched, the normal path) and
+        _fetch_real_options_data's single-ticker fallback produce — kept as
+        one function so the two paths can't silently drift apart."""
+        def _ivs(contracts):
+            vals = []
+            for c in contracts:
+                s = snaps.get(c.symbol)
+                iv = getattr(s, 'implied_volatility', None) if s else None
+                if iv and iv > 0:
+                    vals.append(float(iv))
+            return vals
+
+        call_ivs = _ivs(calls)
+        put_ivs = _ivs(puts)
+        call_iv = sum(call_ivs) / len(call_ivs) if call_ivs else 0.25
+        put_iv = sum(put_ivs) / len(put_ivs) if put_ivs else 0.25
+
+        # Put/call OI ratio — > 1 is bearish skew
+        call_oi = sum(int(c.open_interest or 0) for c in calls)
+        put_oi = sum(int(c.open_interest or 0) for c in puts)
+        pc_ratio = put_oi / max(call_oi, 1)
+
+        def _top_recs(contracts, n=2):
+            if not contracts:
+                return []
+            # Ranked by open interest (liquidity) — same "most relevant
+            # contracts" intent as the old volume-based ranking, using
+            # what Alpaca's contract object actually exposes.
+            ranked = sorted(contracts, key=lambda c: int(c.open_interest or 0), reverse=True)
+            recs = []
+            for c in ranked[:n]:
+                s = snaps.get(c.symbol)
+                iv = getattr(s, 'implied_volatility', None) if s else None
+                iv = float(iv) if iv and iv > 0 else 0.25
+                recs.append({
+                    'strike': float(c.strike_price),
+                    'suitability': {'option_score': min(95, int(iv * 150 + 40))}
+                })
+            return recs
+
+        # ── IV Rank (proxy via realized vol comparison) ──────────────────
+        # Unchanged math from the yfinance version — only the IV input
+        # source changed. Compare ATM implied vol to 20-day historical vol.
+        # IV/HV ratio > 2 = expensive options (rank ~100), < 0.7 = cheap (rank ~0).
+        iv_rank = 50.0
+        hv_df = self._ohlcv_cache.get(ticker)
+        if hv_df is not None and len(hv_df) >= 21:
+            log_ret = np.log(hv_df['close'].astype(float) / hv_df['close'].astype(float).shift(1)).dropna()
+            hv20 = float(log_ret.tail(20).std() * np.sqrt(252))
+            if hv20 > 0:
+                iv_hv_ratio = call_iv / hv20
+                iv_rank = round(min(100.0, max(0.0, (iv_hv_ratio - 0.7) / 1.3 * 100)), 1)
+
+        return {
+            'calls': {
+                'recommendations': _top_recs(calls) or [{'strike': round(price * 1.05), 'suitability': {'option_score': 60}}],
+                'avg_iv': call_iv
+            },
+            'puts': {
+                'recommendations': _top_recs(puts) or [{'strike': round(price * 0.95), 'suitability': {'option_score': 55}}],
+                'avg_iv': put_iv
+            },
+            'pc_ratio': pc_ratio,
+            'iv_rank': iv_rank,
+        }
+
+    def _get_alpaca_options_clients(self):
+        """Lazily build + cache the Trading/OptionHistoricalDataClient pair
+        used by both prefetch_options_data and _fetch_real_options_data's
+        fallback. Each client builds its own requests.Session() (confirmed
+        by reading the SDK source), so building one per ticker/call meant
+        every one of ~1,660 tickers paid a cold TCP+TLS handshake instead
+        of reusing a warm connection — app.py's _get_liquidity_client()
+        already used this cached pattern for the same SDK calls elsewhere;
+        this brings mcp_stock_agent.py in line with it."""
+        from alpaca.trading.client import TradingClient
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+
+        key = os.environ.get('ALPACA_API_KEY', '')
+        secret = os.environ.get('ALPACA_API_SECRET', '')
+        if not key or not secret:
+            raise RuntimeError("Alpaca credentials not configured")
+        if self._alpaca_trading_client is None:
+            self._alpaca_trading_client = TradingClient(key, secret, paper=True)
+        if self._alpaca_option_data_client is None:
+            self._alpaca_option_data_client = OptionHistoricalDataClient(key, secret)
+        return self._alpaca_trading_client, self._alpaca_option_data_client
+
+    def prefetch_options_data(self, tickers_with_prices: List[Tuple[str, float]]) -> None:
+        """Batch-fetch options contract + snapshot data for ALL candidate
+        tickers up front, before Pass 2's per-ticker analysis begins —
+        populates self._options_cache so _fetch_real_options_data's
+        per-ticker calls become pure cache hits for the normal case.
+        Mirrors the existing prefetch_ohlcv pattern.
+
+        Root cause this exists to fix: GetOptionContractsRequest goes
+        through Alpaca's TRADING API, which has an account-wide ~200
+        req/min limit. Calling it once per ticker for ~1,660 tickers
+        created a hard floor of ~8+ minutes no matter how fast individual
+        calls were or how well connections were reused — confirmed
+        directly in production: two full scans, one before and one after
+        a client-reuse fix, both landed at 7.5-8.5 minutes regardless,
+        which is what pointed at the account-wide rate limit rather than
+        per-call connection overhead as the real bottleneck. This alone
+        was enough to make the automatic scheduler (hard 240s timeout,
+        unlike the manual /refresh-now endpoint that triggered these test
+        runs) fail every single cycle.
+
+        GetOptionContractsRequest's own underlying_symbols param accepts a
+        list of tickers in one call — batching ~50 per call cuts total
+        Trading-API calls from ~1,660 down to ~35, comfortably inside the
+        rate limit. Per-ticker strike filtering (±10% of that ticker's own
+        price) can't be expressed as a single shared filter across a batch
+        of tickers at different prices, so this fetches each batch's full
+        contract list for the expiry window and filters strikes
+        client-side per ticker afterward instead."""
+        now = datetime.utcnow()
+        try:
+            from alpaca.trading.requests import GetOptionContractsRequest
+            from alpaca.trading.enums import ContractType
+            from alpaca.data.requests import OptionSnapshotRequest
+            from datetime import date as _date, timedelta as _timedelta
+
+            trading_client, data_client = self._get_alpaca_options_clients()
+
+            price_map = {t: p for t, p in tickers_with_prices if p and p > 0}
+            exp_lo = _date.today() + _timedelta(days=14)
+            exp_hi = _date.today() + _timedelta(days=45)
+
+            BATCH_SIZE = 50
+            all_tickers = list(price_map.keys())
+            contracts_by_ticker: Dict[str, List] = {}
+
+            for i in range(0, len(all_tickers), BATCH_SIZE):
+                batch = all_tickers[i:i + BATCH_SIZE]
+                try:
+                    # No strike filter here (prices differ per ticker in a
+                    # batch, see the docstring), so per-ticker contract
+                    # volume in one batch is unpredictable — a few heavily-
+                    # optioned names sharing a batch could plausibly exceed
+                    # a smaller cap and silently starve other tickers in
+                    # that same batch of any contracts at all. Always
+                    # request the API's documented max instead of scaling
+                    # the limit off BATCH_SIZE.
+                    req = GetOptionContractsRequest(
+                        underlying_symbols=batch,
+                        expiration_date_gte=exp_lo,
+                        expiration_date_lte=exp_hi,
+                        limit=10000,
+                    )
+                    resp = trading_client.get_option_contracts(req)
+                    batch_contracts = resp.option_contracts if hasattr(resp, 'option_contracts') else list(resp)
+                    for c in batch_contracts:
+                        contracts_by_ticker.setdefault(c.underlying_symbol, []).append(c)
+                    # Not paginated further — a 50-ticker batch hitting the
+                    # 10,000-contract API max would need an implausibly
+                    # option-heavy batch, but flag it if it ever happens so
+                    # a silently-truncated batch is at least debuggable.
+                    if getattr(resp, 'next_page_token', None):
+                        logger.warning(f"[Options] Batch contract fetch truncated at 10,000 "
+                                        f"for batch starting {batch[0]} — some tickers in this "
+                                        f"batch may be missing contracts this cycle")
+                except Exception as e:
+                    logger.debug(f"[Options] Batch contract fetch failed for {batch[:3]}...: {e}")
+
+            # Per-ticker: filter to this ticker's own ATM window, pick top
+            # calls/puts by open interest — same selection
+            # _fetch_real_options_data's single-ticker path uses.
+            selected: Dict[str, Dict[str, List]] = {}
+            all_snapshot_symbols: List[str] = []
+            for ticker, contracts in contracts_by_ticker.items():
+                price = price_map.get(ticker)
+                if not price:
+                    continue
+                lo, hi = round(price * 0.90, 2), round(price * 1.10, 2)
+                in_range = [c for c in contracts if lo <= c.strike_price <= hi]
+                calls = sorted([c for c in in_range if c.type == ContractType.CALL],
+                                key=lambda c: int(c.open_interest or 0), reverse=True)[:15]
+                puts = sorted([c for c in in_range if c.type == ContractType.PUT],
+                               key=lambda c: int(c.open_interest or 0), reverse=True)[:15]
+                if not calls and not puts:
+                    continue
+                selected[ticker] = {'calls': calls, 'puts': puts}
+                all_snapshot_symbols.extend(c.symbol for c in calls + puts)
+
+            # Snapshot calls go through the market-data API — a separate
+            # rate limit from the trading API used above. Chunked to keep
+            # each request's URL a sane size, not to dodge a rate limit.
+            SNAPSHOT_CHUNK = 250
+            snaps: Dict = {}
+            for i in range(0, len(all_snapshot_symbols), SNAPSHOT_CHUNK):
+                chunk = all_snapshot_symbols[i:i + SNAPSHOT_CHUNK]
+                try:
+                    snap_req = OptionSnapshotRequest(symbol_or_symbols=chunk)
+                    snaps.update(data_client.get_option_snapshot(snap_req))
+                except Exception as e:
+                    logger.debug(f"[Options] Batch snapshot fetch failed for a chunk of {len(chunk)}: {e}")
+
+            for ticker, sel in selected.items():
+                result = self._build_options_result(ticker, price_map[ticker], sel['calls'], sel['puts'], snaps)
+                self._options_cache[ticker] = (result, now)
+
+            logger.info(f"[Options] Prefetched batch options data for {len(selected)}/{len(all_tickers)} tickers")
+        except Exception as e:
+            logger.error(f"[Options] Batch options prefetch failed entirely — per-ticker fallback will cover it: {e}")
+
     def _fetch_real_options_data(self, ticker: str, price: float) -> Dict:
         """Fetch real options chain: IV per contract, put/call ratio, ATM
         recommendations. Alpaca-backed — replaced a yfinance options-chain
@@ -1207,7 +1416,15 @@ class MCPStockAgent:
         already used reliably elsewhere in this app (covered-calls premium
         fetching), and its option snapshot returns real implied_volatility
         directly — no manual IV computation needed, unlike yfinance's raw
-        chain."""
+        chain.
+
+        Normally a pure cache hit — prefetch_options_data populates
+        self._options_cache for every candidate before Pass 2 begins, in
+        one batched pass instead of one Trading-API call per ticker (see
+        that method's docstring for why the per-ticker version was a
+        serious bottleneck at scale). This per-ticker path only actually
+        hits the network for a ticker prefetch missed entirely (e.g. a
+        news-discovered ticker added after the candidate list was built)."""
         now = datetime.utcnow()
         if ticker in self._options_cache:
             cached, fetched_at = self._options_cache[ticker]
@@ -1215,53 +1432,19 @@ class MCPStockAgent:
                 return cached
 
         try:
-            from alpaca.trading.client import TradingClient
             from alpaca.trading.requests import GetOptionContractsRequest
             from alpaca.trading.enums import ContractType
-            from alpaca.data.historical.option import OptionHistoricalDataClient
             from alpaca.data.requests import OptionSnapshotRequest
             from datetime import date as _date, timedelta as _timedelta
 
-            key = os.environ.get('ALPACA_API_KEY', '')
-            secret = os.environ.get('ALPACA_API_SECRET', '')
-            if not key or not secret:
-                raise RuntimeError("Alpaca credentials not configured")
+            trading_client, data_client = self._get_alpaca_options_clients()
 
-            # Reused across every ticker/call — see the __init__ comment on
-            # these attributes for why building fresh clients per-call was
-            # a serious latency bug at ~1,660-ticker scale. requests.Session
-            # (which these wrap) is safe for concurrent use across threads.
-            if self._alpaca_trading_client is None:
-                self._alpaca_trading_client = TradingClient(key, secret, paper=True)
-            if self._alpaca_option_data_client is None:
-                self._alpaca_option_data_client = OptionHistoricalDataClient(key, secret)
-            trading_client = self._alpaca_trading_client
-            data_client = self._alpaca_option_data_client
-
-            # ATM window: ±10% of current price, same as before. Expiry
-            # window 14-45 days out — avoids 0DTE noise on one end and
-            # LEAPS on the other, roughly matching the old "nearest expiry
-            # >=7 days out" intent with a bounded upper end too.
+            # ATM window: ±10% of current price. Expiry window 14-45 days
+            # out — avoids 0DTE noise on one end and LEAPS on the other.
             lo, hi = round(price * 0.90, 2), round(price * 1.10, 2)
             exp_lo = _date.today() + _timedelta(days=14)
             exp_hi = _date.today() + _timedelta(days=45)
 
-            # 2 network calls total per ticker (1 contract list + 1 batched
-            # snapshot), not 4 — an earlier version fetched calls/puts as
-            # separate contract-list AND separate snapshot calls, which was
-            # fine per-ticker but made the full ~1660-ticker scan take
-            # ~15 minutes instead of the usual ~3, risking every automatic
-            # scheduler cycle hitting its own 240s timeout. Alpaca returns
-            # both contract types in one call when `type` is omitted.
-            # limit=30 cut the contract-list call from 3-6s to <0.1s for
-            # most tickers in direct testing (heavily-optioned tickers were
-            # the slow ones — Alpaca's backend appears to spend that time
-            # server-side building the larger unlimited result set before
-            # this client ever sees it). Some individual calls still run
-            # slow regardless (observed variability isn't tied to any one
-            # ticker consistently) — 16-way scan concurrency and the
-            # scheduler's own 240s cycle timeout are the backstops for that
-            # residual variance, not something fixable purely client-side.
             req = GetOptionContractsRequest(
                 underlying_symbols=[ticker],
                 expiration_date_gte=exp_lo,
@@ -1280,72 +1463,11 @@ class MCPStockAgent:
             if symbols:
                 snap_req = OptionSnapshotRequest(symbol_or_symbols=symbols)
                 snaps = data_client.get_option_snapshot(snap_req)
-            call_snaps = put_snaps = snaps  # same combined dict, kept as two names below for minimal diff
 
-            def _ivs(contracts, snaps):
-                vals = []
-                for c in contracts:
-                    s = snaps.get(c.symbol)
-                    iv = getattr(s, 'implied_volatility', None) if s else None
-                    if iv and iv > 0:
-                        vals.append(float(iv))
-                return vals
-
-            call_ivs = _ivs(calls, call_snaps)
-            put_ivs = _ivs(puts, put_snaps)
-            call_iv = sum(call_ivs) / len(call_ivs) if call_ivs else 0.25
-            put_iv = sum(put_ivs) / len(put_ivs) if put_ivs else 0.25
-
-            # Put/call OI ratio — > 1 is bearish skew
-            call_oi = sum(int(c.open_interest or 0) for c in calls)
-            put_oi = sum(int(c.open_interest or 0) for c in puts)
-            pc_ratio = put_oi / max(call_oi, 1)
-
-            def _top_recs(contracts, snaps, n=2):
-                if not contracts:
-                    return []
-                # Ranked by open interest (liquidity) — same "most relevant
-                # contracts" intent as the old volume-based ranking, using
-                # what Alpaca's contract object actually exposes.
-                ranked = sorted(contracts, key=lambda c: int(c.open_interest or 0), reverse=True)
-                recs = []
-                for c in ranked[:n]:
-                    s = snaps.get(c.symbol)
-                    iv = getattr(s, 'implied_volatility', None) if s else None
-                    iv = float(iv) if iv and iv > 0 else 0.25
-                    recs.append({
-                        'strike': float(c.strike_price),
-                        'suitability': {'option_score': min(95, int(iv * 150 + 40))}
-                    })
-                return recs
-
-            # ── IV Rank (proxy via realized vol comparison) ──────────────────
-            # Unchanged math from the yfinance version — only the IV input
-            # source changed. Compare ATM implied vol to 20-day historical vol.
-            # IV/HV ratio > 2 = expensive options (rank ~100), < 0.7 = cheap (rank ~0).
-            iv_rank = 50.0
-            hv_df = self._ohlcv_cache.get(ticker)
-            if hv_df is not None and len(hv_df) >= 21:
-                log_ret = np.log(hv_df['close'].astype(float) / hv_df['close'].astype(float).shift(1)).dropna()
-                hv20 = float(log_ret.tail(20).std() * np.sqrt(252))
-                if hv20 > 0:
-                    iv_hv_ratio = call_iv / hv20
-                    iv_rank = round(min(100.0, max(0.0, (iv_hv_ratio - 0.7) / 1.3 * 100)), 1)
-
-            result = {
-                'calls': {
-                    'recommendations': _top_recs(calls, call_snaps) or [{'strike': round(price * 1.05), 'suitability': {'option_score': 60}}],
-                    'avg_iv': call_iv
-                },
-                'puts': {
-                    'recommendations': _top_recs(puts, put_snaps) or [{'strike': round(price * 0.95), 'suitability': {'option_score': 55}}],
-                    'avg_iv': put_iv
-                },
-                'pc_ratio': pc_ratio,
-                'iv_rank': iv_rank,
-            }
+            result = self._build_options_result(ticker, price, calls, puts, snaps)
             self._options_cache[ticker] = (result, now)
-            logger.debug(f"[Options] {ticker} call_iv={call_iv:.2f} put_iv={put_iv:.2f} pc={pc_ratio:.2f} (Alpaca)")
+            logger.debug(f"[Options] {ticker} call_iv={result['calls']['avg_iv']:.2f} "
+                         f"put_iv={result['puts']['avg_iv']:.2f} pc={result['pc_ratio']:.2f} (Alpaca, per-ticker fallback)")
             return result
 
         except Exception as e:

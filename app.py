@@ -1995,6 +1995,14 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
         candidates.append((ticker, float(price)))
 
+    # Batch-prefetch options data for every candidate in a handful of large
+    # calls instead of one Trading-API call per ticker in Pass 2 — see
+    # prefetch_options_data's docstring for why the per-ticker version was
+    # a hard bottleneck (Alpaca's Trading API is rate-limited account-wide,
+    # independent of connection reuse or thread concurrency; confirmed in
+    # production that a full scan took 7.5-8.5 minutes regardless).
+    await loop.run_in_executor(None, stock_agent.prefetch_options_data, candidates)
+
     # Pass 2 — the expensive part, run concurrently across a thread pool.
     # Two-tier: tier 1 is Alpaca+technical+news only (use_finnhub=False,
     # neutral earnings/analyst defaults) for every candidate — cheap, no
