@@ -2197,7 +2197,12 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
     return latest_options_recs
 
 
-SP500_SCAN_INTERVAL = 2 * 60  # matches local_runner.py's cadence
+SP500_SCAN_INTERVAL = 60  # cooldown after each scan finishes, not a fixed
+# clock tick — the loop is sequential (scan, then sleep, then scan again),
+# so this never overlaps a running scan. Lowered from 2 min once the
+# options-fetch batching fix (see prefetch_options_data) cut scan time
+# from 7.5-8.5 min back down to ~2.5 min; real cadence is scan time + this
+# value, not this value alone.
 
 
 async def _sp500_scheduler_loop():
@@ -2476,11 +2481,12 @@ async def get_sp500_options_recommendations(
         "last_analysis": last_sp500_run.isoformat() if last_sp500_run else None,
         "total_available": len(latest_options_recs),
         "count": len(recs),
-        # SP500_SCAN_INTERVAL alone (2 min) understates this — that's just
-        # the sleep between cycles, not the scan itself, which now takes
-        # 2.5-3 min over the current 1657-ticker universe (see the scheduler
-        # loop's timeout comment). ~5 min total is a rough but honest
-        # estimate of real end-to-end cadence, not a precise measurement.
+        # SP500_SCAN_INTERVAL alone (1 min) understates this — that's just
+        # the sleep between cycles, not the scan itself, which takes
+        # ~2.5 min over the current ~1660-ticker universe since the
+        # options-fetch batching fix (see prefetch_options_data). ~3.5 min
+        # total is a rough but honest estimate of real end-to-end cadence,
+        # not a precise measurement.
         "next_refresh_in_minutes": SP500_SCAN_INTERVAL // 60 + 3,
         "recommendations": [asdict(r) for r in recs],
     }
@@ -3368,7 +3374,7 @@ async def websocket_sp500_options(websocket: WebSocket):
     Real-time WebSocket for SP500 options recommendations.
 
     Sends a snapshot immediately on connect, then pushes updates on every
-    scan cycle (~2 min during market hours — see SP500_SCAN_INTERVAL).
+    scan cycle (~3.5 min during market hours — see SP500_SCAN_INTERVAL).
     Each message has the structure:
       {
         "event": "sp500_options_update",
