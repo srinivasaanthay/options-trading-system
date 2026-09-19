@@ -157,7 +157,7 @@ class OptionsRecommendation:
     fade_streak_total: int = 0
     # Analysts covering this ticker — < 3 means fundamental_score (and the
     # "Fundamentals" component below) is a neutral default, not a real
-    # read. See _fetch_ticker_fundamentals_from_finnhub.
+    # read. See _fetch_ticker_fast_fundamentals.
     analyst_count: int = 0
     # The REAL composite-score math, exposed so the UI never has to (and
     # never again silently drifts from) reconstruct it client-side — see
@@ -1353,9 +1353,10 @@ def _compute_catalyst_freshness(ticker: str, headlines: list, current_price: flo
 
 def _fetch_fundamentals(ticker: str) -> dict:
     """Fetch key fundamental metrics for display in Before You Buy. Reads
-    the persistent, daily-refreshed ticker_fundamentals table (see
-    _fundamentals_refresh_loop) instead of making its own live Finnhub
-    call — consolidated onto the same Postgres-cached pipeline the scoring
+    the persistent ticker_fundamentals table (see
+    _fundamentals_slow_refresh_loop / _fundamentals_fast_refresh_loop)
+    instead of making its own live Finnhub call — consolidated onto the
+    same Postgres-cached pipeline the scoring
     path uses, rather than maintaining a second independent Finnhub fetch
     for the same underlying data. Display-only, not a scoring input, so
     missing/not-yet-refreshed coverage is an acceptable degradation (None
@@ -1468,13 +1469,14 @@ def _get_pg_conn():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_ticker_time ON scan_history (ticker, scan_time)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_time ON scan_history (scan_time)")
-            # Persistent, daily-refreshed Finnhub fundamentals — replaces the
+            # Persistent, split-cadence Finnhub fundamentals — replaces the
             # in-memory per-process caches that used to get wiped on every
             # Railway restart (forcing a slow rate-limited re-warm scoped to
-            # only the top ~30 candidates each scan). A separate background
-            # job (see _fundamentals_refresh_loop) walks the full ticker
-            # universe once a day and upserts here; the hot scan path only
-            # ever does a fast read, never a live Finnhub call.
+            # only the top ~30 candidates each scan). Two background loops
+            # (see _fundamentals_slow_refresh_loop, weekly, and
+            # _fundamentals_fast_refresh_loop, daily) walk the full ticker
+            # universe and upsert here; the hot scan path only ever does a
+            # fast read, never a live Finnhub call.
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ticker_fundamentals (
                     ticker TEXT PRIMARY KEY,
@@ -1504,14 +1506,25 @@ def _get_pg_conn():
         return None
 
 
-# ── Persistent, daily-refreshed Finnhub fundamentals ────────────────────────
+# ── Persistent, split-cadence Finnhub fundamentals ──────────────────────────
 # Replaces the old per-process in-memory caches (wiped on every Railway
 # restart, which forced a slow rate-limited re-warm scoped to only the top
-# ~30 scan candidates each cycle). _fundamentals_refresh_loop walks the full
-# ticker universe once a day and upserts here; the scan's hot path only ever
-# does a fast bulk Postgres read (see _load_ticker_fundamentals_bulk), never
-# a live Finnhub call — so every ticker gets real data, not just top-scorers,
-# and none of it is lost on redeploy.
+# ~30 scan candidates each cycle). Two independent background loops keep
+# ticker_fundamentals fresh; the scan's hot path only ever does a fast bulk
+# Postgres read (see _load_ticker_fundamentals_bulk), never a live Finnhub
+# call — so every ticker gets real data, not just top-scorers, and none of
+# it is lost on redeploy.
+#
+# Split by how often each field actually changes, not refreshed uniformly:
+#   - industry, earnings_date: weekly. A company's sector classification is
+#     essentially permanent, and its next earnings date only moves roughly
+#     once a quarter (a new date gets confirmed, or the prior one passes and
+#     rolls to the next). Daily refreshing these bought nothing.
+#   - analyst consensus, financial ratios/growth: daily, since these
+#     genuinely can shift day to day (new ratings, updated filings).
+# 2 calls/ticker either way instead of 4, so the daily pass -- the one that
+# matters for freshness -- drops from ~2.2h to ~1.1h for a full ~1,660-
+# ticker universe, and the weekly pass has a full 7 days to complete.
 
 _FUNDAMENTALS_FIELDS = [
     'industry', 'earnings_date', 'analyst_upside', 'analyst_count', 'fundamental_score',
@@ -1520,27 +1533,17 @@ _FUNDAMENTALS_FIELDS = [
 ]
 
 
-def _fetch_ticker_fundamentals_from_finnhub(ticker: str) -> dict:
-    """Consolidated per-ticker Finnhub fetch for the daily background
-    refresh: industry (profile2), soonest upcoming earnings date
-    (calendar/earnings), analyst consensus (recommendation), and financial
-    ratios/growth (metric) -- four calls, rate-limited via the shared
-    finnhub_limiter. Only ever called from the slow, patient background
-    loop below, never from the scan's hot path.
-
-    analyst_upside/fundamental_score math is unchanged from the original
-    per-scan version: Finnhub's free tier blocks price-target and
-    short-interest data outright, so analyst_upside is a consensus-derived
-    proxy (buy/hold/sell counts, not a literal price target), and
-    short_interest's neutral 0.3 contribution to fundamental_score reflects
-    "no data" the same way it always has."""
+def _fetch_ticker_slow_fundamentals(ticker: str) -> dict:
+    """Industry (profile2) + soonest upcoming earnings date
+    (calendar/earnings) — two calls, refreshed weekly (see
+    _fundamentals_slow_refresh_loop). Rate-limited via the shared
+    finnhub_limiter; only ever called from that background loop."""
     from mcp_stock_agent import finnhub_limiter
     import requests
     from datetime import date as _date, timedelta as _timedelta
 
     api_key = os.environ.get('FINNHUB_API_KEY', '')
-    result = {k: None for k in _FUNDAMENTALS_FIELDS}
-    result.update({'analyst_upside': 0.0, 'analyst_count': 0, 'fundamental_score': 0.5})
+    result = {'industry': None, 'earnings_date': None}
     if not api_key:
         return result
 
@@ -1565,6 +1568,34 @@ def _fetch_ticker_fundamentals_from_finnhub(ticker: str) -> dict:
             result['earnings_date'] = events[0]["date"]  # sorted soonest-first
     except Exception as e:
         logger.debug(f"[FundamentalsRefresh] {ticker} earnings failed: {e}")
+
+    return result
+
+
+def _fetch_ticker_fast_fundamentals(ticker: str) -> dict:
+    """Analyst consensus (recommendation) + financial ratios/growth
+    (metric) — two calls, refreshed daily (see
+    _fundamentals_fast_refresh_loop). Rate-limited via the shared
+    finnhub_limiter; only ever called from that background loop.
+
+    analyst_upside/fundamental_score math is unchanged from the original
+    per-scan version: Finnhub's free tier blocks price-target and
+    short-interest data outright, so analyst_upside is a consensus-derived
+    proxy (buy/hold/sell counts, not a literal price target), and
+    short_interest's neutral 0.3 contribution to fundamental_score reflects
+    "no data" the same way it always has."""
+    from mcp_stock_agent import finnhub_limiter
+    import requests
+
+    api_key = os.environ.get('FINNHUB_API_KEY', '')
+    result = {
+        'analyst_upside': 0.0, 'analyst_count': 0, 'fundamental_score': 0.5,
+        'debt_to_equity': None, 'current_ratio': None, 'revenue_growth': None, 'earnings_growth': None,
+        'profit_margins': None, 'gross_margins': None, 'trailing_pe': None, 'forward_pe': None,
+        'price_to_book': None, 'return_on_equity': None,
+    }
+    if not api_key:
+        return result
 
     try:
         finnhub_limiter.acquire()
@@ -1621,7 +1652,30 @@ def _fetch_ticker_fundamentals_from_finnhub(ticker: str) -> dict:
     return result
 
 
-def _save_ticker_fundamentals_pg(ticker: str, data: dict) -> None:
+def _save_ticker_slow_fundamentals_pg(ticker: str, data: dict) -> None:
+    """Partial upsert — only touches industry/earnings_date, leaving
+    whatever the fast loop last wrote (or the fast-field defaults on a
+    brand-new ticker) untouched."""
+    conn = _get_pg_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ticker_fundamentals (ticker, industry, earnings_date, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (ticker) DO UPDATE SET
+                    industry = EXCLUDED.industry, earnings_date = EXCLUDED.earnings_date, updated_at = now()
+            """, (ticker, data.get('industry'), data.get('earnings_date')))
+        conn.commit()
+    except Exception as e:
+        logger.warning(f"[FundamentalsRefresh] Postgres save (slow) failed for {ticker}: {e}")
+
+
+def _save_ticker_fast_fundamentals_pg(ticker: str, data: dict) -> None:
+    """Partial upsert — only touches analyst/ratio fields, leaving
+    industry/earnings_date (or NULL, on a brand-new ticker the slow loop
+    hasn't reached yet) untouched."""
     conn = _get_pg_conn()
     if conn is None:
         return
@@ -1629,13 +1683,12 @@ def _save_ticker_fundamentals_pg(ticker: str, data: dict) -> None:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO ticker_fundamentals (
-                    ticker, industry, earnings_date, analyst_upside, analyst_count, fundamental_score,
+                    ticker, analyst_upside, analyst_count, fundamental_score,
                     debt_to_equity, current_ratio, revenue_growth, earnings_growth,
                     profit_margins, gross_margins, trailing_pe, forward_pe, price_to_book, return_on_equity,
                     updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                 ON CONFLICT (ticker) DO UPDATE SET
-                    industry = EXCLUDED.industry, earnings_date = EXCLUDED.earnings_date,
                     analyst_upside = EXCLUDED.analyst_upside, analyst_count = EXCLUDED.analyst_count,
                     fundamental_score = EXCLUDED.fundamental_score, debt_to_equity = EXCLUDED.debt_to_equity,
                     current_ratio = EXCLUDED.current_ratio, revenue_growth = EXCLUDED.revenue_growth,
@@ -1643,14 +1696,14 @@ def _save_ticker_fundamentals_pg(ticker: str, data: dict) -> None:
                     gross_margins = EXCLUDED.gross_margins, trailing_pe = EXCLUDED.trailing_pe,
                     forward_pe = EXCLUDED.forward_pe, price_to_book = EXCLUDED.price_to_book,
                     return_on_equity = EXCLUDED.return_on_equity, updated_at = now()
-            """, (ticker, data.get('industry'), data.get('earnings_date'), data.get('analyst_upside'),
-                  data.get('analyst_count'), data.get('fundamental_score'), data.get('debt_to_equity'),
-                  data.get('current_ratio'), data.get('revenue_growth'), data.get('earnings_growth'),
-                  data.get('profit_margins'), data.get('gross_margins'), data.get('trailing_pe'),
-                  data.get('forward_pe'), data.get('price_to_book'), data.get('return_on_equity')))
+            """, (ticker, data.get('analyst_upside'), data.get('analyst_count'), data.get('fundamental_score'),
+                  data.get('debt_to_equity'), data.get('current_ratio'), data.get('revenue_growth'),
+                  data.get('earnings_growth'), data.get('profit_margins'), data.get('gross_margins'),
+                  data.get('trailing_pe'), data.get('forward_pe'), data.get('price_to_book'),
+                  data.get('return_on_equity')))
         conn.commit()
     except Exception as e:
-        logger.warning(f"[FundamentalsRefresh] Postgres save failed for {ticker}: {e}")
+        logger.warning(f"[FundamentalsRefresh] Postgres save (fast) failed for {ticker}: {e}")
 
 
 def _load_ticker_fundamentals_bulk(tickers: List[str]) -> Dict[str, dict]:
@@ -1672,35 +1725,52 @@ def _load_ticker_fundamentals_bulk(tickers: List[str]) -> Dict[str, dict]:
         return {}
 
 
-async def _fundamentals_refresh_loop():
-    """Background job, fully independent of the main scan cycle: once a
-    day, walk the full ticker universe and refresh ticker_fundamentals from
-    Finnhub. ~1,660 tickers x 4 calls each / 50 per min (shared
-    finnhub_limiter) ~= ~2.2 hours for a full pass -- comfortably inside a
-    24h cadence, and since this never runs inside a scan's time budget,
-    there's no rush and no need to scope it to a top-N subset the way the
-    old in-scan tier-2 pass had to."""
-    await asyncio.sleep(90)  # let the server come up healthy first
+async def _fundamentals_refresh_loop_impl(label: str, fetch_fn, save_fn, start_delay: int, period_seconds: int) -> None:
+    """Shared driver for both cadences below — walks the full ticker
+    universe once, fetching+saving one ticker at a time (paced entirely by
+    the shared finnhub_limiter, no manual concurrency), then sleeps until
+    the next pass. Fully independent of the main scan cycle, so there's no
+    rush and no need to scope either pass to a top-N subset the way the old
+    in-scan tier-2 pass had to."""
+    await asyncio.sleep(start_delay)
     while True:
         try:
             from dynamic_tickers import get_dynamic_tickers
             loop = asyncio.get_event_loop()
             tickers = await loop.run_in_executor(None, get_dynamic_tickers)
-            logger.info(f"[FundamentalsRefresh] Starting daily pass over {len(tickers)} tickers")
+            logger.info(f"[FundamentalsRefresh:{label}] Starting pass over {len(tickers)} tickers")
             done = 0
             for ticker in tickers:
                 try:
-                    data = await loop.run_in_executor(None, _fetch_ticker_fundamentals_from_finnhub, ticker)
-                    await loop.run_in_executor(None, _save_ticker_fundamentals_pg, ticker, data)
+                    data = await loop.run_in_executor(None, fetch_fn, ticker)
+                    await loop.run_in_executor(None, save_fn, ticker, data)
                     done += 1
                     if done % 200 == 0:
-                        logger.info(f"[FundamentalsRefresh] {done}/{len(tickers)} done")
+                        logger.info(f"[FundamentalsRefresh:{label}] {done}/{len(tickers)} done")
                 except Exception as e:
-                    logger.debug(f"[FundamentalsRefresh] {ticker} failed: {e}")
-            logger.info(f"[FundamentalsRefresh] Full pass complete: {done}/{len(tickers)}")
+                    logger.debug(f"[FundamentalsRefresh:{label}] {ticker} failed: {e}")
+            logger.info(f"[FundamentalsRefresh:{label}] Pass complete: {done}/{len(tickers)}")
         except Exception as e:
-            logger.error(f"[FundamentalsRefresh] Loop error: {e}")
-        await asyncio.sleep(24 * 3600)
+            logger.error(f"[FundamentalsRefresh:{label}] Loop error: {e}")
+        await asyncio.sleep(period_seconds)
+
+
+async def _fundamentals_slow_refresh_loop():
+    """Industry + earnings date, once a week."""
+    await _fundamentals_refresh_loop_impl(
+        "slow", _fetch_ticker_slow_fundamentals, _save_ticker_slow_fundamentals_pg,
+        start_delay=90, period_seconds=7 * 24 * 3600)
+
+
+async def _fundamentals_fast_refresh_loop():
+    """Analyst consensus + financial ratios/growth, once a day. Staggered
+    120s after the slow loop's 90s start so both don't both burst-fetch
+    Finnhub at boot simultaneously (they'd still be correctly paced by the
+    shared finnhub_limiter either way, but this keeps the very first
+    minute of each deploy calmer)."""
+    await _fundamentals_refresh_loop_impl(
+        "fast", _fetch_ticker_fast_fundamentals, _save_ticker_fast_fundamentals_pg,
+        start_delay=120, period_seconds=24 * 3600)
 
 
 def _save_results_pg():
@@ -1905,7 +1975,7 @@ def _fetch_prev_closes_batch(tickers: List[str]) -> Dict[str, float]:
     """Previous session's close per ticker, via the same Alpaca snapshot data
     _fetch_prices_batch already pulls current prices from. Used as an
     earnings/news-agnostic gap check — the earnings-date lookup is unreliable
-    exactly around the event itself (see _fetch_ticker_fundamentals_from_finnhub),
+    exactly around the event itself (see _fetch_ticker_slow_fundamentals),
     but a large already-happened gap is a reliable signal regardless of the cause."""
     prev_closes: Dict[str, float] = {}
     if not (_ALPACA_KEY and _ALPACA_SECRET):
@@ -2272,14 +2342,15 @@ async def _analyze_sp500_options() -> List[OptionsRecommendation]:
 
     # Fundamentals (earnings date, analyst consensus, industry, etc.) come
     # from a fast bulk Postgres read now, not a live Finnhub call — see
-    # _load_ticker_fundamentals_bulk and _fundamentals_refresh_loop. This
-    # used to need a two-tier scan (score everyone cheaply first, then spend
-    # Finnhub's rate-limited budget only on the top ~30) because Finnhub's
-    # free tier (60 calls/min) couldn't cover live per-ticker calls for the
-    # full ~1,600-ticker universe. Now that Finnhub fetching happens once a
-    # day in its own background loop instead of inside the scan, every
-    # candidate gets real fundamentals, not just the top-scorers, and this
-    # collapses back to one pass.
+    # _load_ticker_fundamentals_bulk and the two background refresh loops
+    # (_fundamentals_slow_refresh_loop, _fundamentals_fast_refresh_loop).
+    # This used to need a two-tier scan (score everyone cheaply first, then
+    # spend Finnhub's rate-limited budget only on the top ~30) because
+    # Finnhub's free tier (60 calls/min) couldn't cover live per-ticker
+    # calls for the full ~1,600-ticker universe. Now that Finnhub fetching
+    # happens on its own background schedule instead of inside the scan,
+    # every candidate gets real fundamentals, not just the top-scorers, and
+    # this collapses back to one pass.
     fundamentals_map = await loop.run_in_executor(
         None, _load_ticker_fundamentals_bulk, [t for t, _ in candidates])
 
@@ -2620,7 +2691,8 @@ async def lifespan(app: FastAPI):
     _load_results()
     sp500_task = asyncio.create_task(_init_all())
     asyncio.create_task(_eod_clear_loop())
-    asyncio.create_task(_fundamentals_refresh_loop())
+    asyncio.create_task(_fundamentals_slow_refresh_loop())
+    asyncio.create_task(_fundamentals_fast_refresh_loop())
     logger.info("System initializing in background — server ready")
 
     yield
