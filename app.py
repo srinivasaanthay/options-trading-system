@@ -258,7 +258,13 @@ def _interpret_composite_score(score: float) -> Tuple[str, str]:
         return "VERY_LOW", "AVOID"
 
 
-MIN_OPEN_INTEREST = 1000  # below this, contracts are too thin to trade reliably (wide spreads, bad fills)
+MIN_OPEN_INTEREST = 500  # below this, contracts are too thin to trade reliably (wide spreads, bad fills).
+# Lowered from 1000 after measuring the real tradeoff directly: 1000 was
+# cutting 80% of the top-100 score-qualified candidates (100 -> 20 final),
+# while 969 tickers were clearing the score bar in the same scan -- the
+# bottleneck was liquidity, not scoring. 500 nearly doubles the final list
+# (20 -> 34 in that same test) while still screening out the truly thin/
+# dead contracts (OI 0-499) where fill risk concentrates most.
 
 _liquidity_client = None  # lazy, cached Alpaca TradingClient — used only for
                            # options-contract/liquidity lookups, not trading
