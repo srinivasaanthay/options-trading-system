@@ -3086,11 +3086,12 @@ async def trigger_sp500_analysis(
     sample = all_tickers[:20]
     price_map = await loop.run_in_executor(None, _fetch_prices_batch, sample)
     await loop.run_in_executor(None, stock_agent.prefetch_ohlcv, sample)
+    fundamentals_map = await loop.run_in_executor(None, _load_ticker_fundamentals_bulk, sample)
     recs = []
     for ticker in sample:
         try:
             price = price_map.get(ticker) or _fallback_price(ticker)
-            result = await stock_agent.analyze_ticker(ticker, float(price))
+            result = await stock_agent.analyze_ticker(ticker, float(price), fundamentals=fundamentals_map.get(ticker))
             is_bullish = result.technical_score >= 0.55
             is_bearish = result.technical_score <= 0.45
             if is_bullish or is_bearish:
@@ -3203,8 +3204,9 @@ async def analyze_stock(
         extremes = await loop.run_in_executor(None, _fetch_intraday_extremes_batch, [ticker])
         t_high, t_low = extremes.get(ticker, (None, None))
         prev_closes = await loop.run_in_executor(None, _fetch_prev_closes_batch, [ticker])
+        fundamentals = (await loop.run_in_executor(None, _load_ticker_fundamentals_bulk, [ticker])).get(ticker)
 
-        result = await stock_agent.analyze_ticker(ticker, float(use_price))
+        result = await stock_agent.analyze_ticker(ticker, float(use_price), fundamentals=fundamentals)
         rec = _make_options_rec(ticker, result, float(use_price), today_high=t_high, today_low=t_low,
                                  prev_close=prev_closes.get(ticker))
         rec.news_headlines = await loop.run_in_executor(None, _fetch_ticker_news, ticker)
@@ -3329,7 +3331,9 @@ async def agent_analyze(
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
     try:
-        result = await stock_agent.analyze_ticker(ticker, price)
+        loop = asyncio.get_event_loop()
+        fundamentals = (await loop.run_in_executor(None, _load_ticker_fundamentals_bulk, [ticker])).get(ticker)
+        result = await stock_agent.analyze_ticker(ticker, price, fundamentals=fundamentals)
         rec = _make_options_rec(ticker, result, price)
         return {
             "ticker": result.ticker,

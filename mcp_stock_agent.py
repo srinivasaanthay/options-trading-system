@@ -39,13 +39,15 @@ class _RateLimiter:
     test against /stock/recommendation got only 12/50 calls through, the
     rest 429'd). Capped at 50, not 60, to leave a safety margin.
 
-    Used by app.py's _fetch_ticker_fundamentals_from_finnhub, called only
-    from the slow daily background refresh loop (_fundamentals_refresh_loop)
-    — not from the scan's hot path anymore. An earlier version of this
-    limiter existed to survive a 16-way-concurrent burst from inside a live
-    scan; that pressure is gone now that Finnhub fetching happens on its own
-    patient daily schedule instead, but the limiter itself is still the
-    right safeguard against exceeding the account-wide cap."""
+    Used by app.py's _fetch_ticker_slow_fundamentals and
+    _fetch_ticker_fast_fundamentals, called only from their respective
+    background refresh loops (_fundamentals_slow_refresh_loop, weekly;
+    _fundamentals_fast_refresh_loop, daily) — not from the scan's hot path
+    anymore. An earlier version of this limiter existed to survive a
+    16-way-concurrent burst from inside a live scan; that pressure is gone
+    now that Finnhub fetching happens on its own patient background
+    schedule instead, but the limiter itself is still the right safeguard
+    against exceeding the account-wide cap."""
     def __init__(self, max_calls: int, period_seconds: float):
         self._max_calls = max_calls
         self._period = period_seconds
@@ -156,7 +158,7 @@ class AnalysisResult:
     fundamental_score: float = 0.5  # 0-1 from analyst targets + short interest
     analyst_count: int = 0          # analysts covering this ticker — < 3 means
                                      # fundamental_score above is a neutral default,
-                                     # not a real read (see app.py's _fetch_ticker_fundamentals_from_finnhub)
+                                     # not a real read (see app.py's _fetch_ticker_fast_fundamentals)
     analyst_upside: float = 0.0     # analyst consensus target vs current price (%)
     short_interest_pct: float = 0.0 # short interest as % of float
     rsi: float = 50.0               # 14-day RSI — was computed for scoring and discarded;
