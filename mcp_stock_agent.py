@@ -35,12 +35,17 @@ class _RateLimiter:
     """Thread-safe sliding-window rate limiter — blocks the calling thread
     until a call is allowed, rather than firing and letting the API reject
     it. Needed because Finnhub's free-tier cap (60/min) applies per API key
-    across ALL endpoints combined, and the scan's 16-way thread pool would
-    otherwise burst far past that in the same second (confirmed directly:
-    a 16-way parallel test against /stock/recommendation got only 12/50
-    calls through, the rest 429'd). Capped at 50, not 60, to leave headroom
-    for app.py's separate top-20 display-fundamentals calls sharing the
-    same Finnhub key."""
+    across ALL endpoints combined (confirmed directly: a 16-way parallel
+    test against /stock/recommendation got only 12/50 calls through, the
+    rest 429'd). Capped at 50, not 60, to leave a safety margin.
+
+    Used by app.py's _fetch_ticker_fundamentals_from_finnhub, called only
+    from the slow daily background refresh loop (_fundamentals_refresh_loop)
+    — not from the scan's hot path anymore. An earlier version of this
+    limiter existed to survive a 16-way-concurrent burst from inside a live
+    scan; that pressure is gone now that Finnhub fetching happens on its own
+    patient daily schedule instead, but the limiter itself is still the
+    right safeguard against exceeding the account-wide cap."""
     def __init__(self, max_calls: int, period_seconds: float):
         self._max_calls = max_calls
         self._period = period_seconds
@@ -151,7 +156,7 @@ class AnalysisResult:
     fundamental_score: float = 0.5  # 0-1 from analyst targets + short interest
     analyst_count: int = 0          # analysts covering this ticker — < 3 means
                                      # fundamental_score above is a neutral default,
-                                     # not a real read (see _fetch_real_fundamental_data)
+                                     # not a real read (see app.py's _fetch_ticker_fundamentals_from_finnhub)
     analyst_upside: float = 0.0     # analyst consensus target vs current price (%)
     short_interest_pct: float = 0.0 # short interest as % of float
     rsi: float = 50.0               # 14-day RSI — was computed for scoring and discarded;
@@ -267,8 +272,6 @@ class MCPStockAgent:
         self._alpaca_trading_client = None
         self._alpaca_option_data_client = None
         self._broad_news_cache: Optional[Tuple[List[Dict], datetime]] = None
-        self._earnings_cache: Dict[str, Tuple[int, datetime]] = {}    # ticker → (days_to_earn, fetched_at)
-        self._fundamental_cache: Dict[str, Tuple[Dict, datetime]] = {} # ticker → (data, fetched_at)
 
         logger.info("MCP Stock Agent initialized successfully")
 
@@ -276,7 +279,7 @@ class MCPStockAgent:
         self,
         ticker: str,
         price: float,
-        use_finnhub: bool = True
+        fundamentals: Optional[Dict] = None,
     ) -> AnalysisResult:
         """
         Analyze a ticker and generate buy signal
@@ -284,17 +287,17 @@ class MCPStockAgent:
         Args:
             ticker: Stock ticker symbol
             price: Current stock price
-            use_finnhub: When False, skip the Finnhub-backed earnings-date
-                and analyst-consensus calls entirely and use their neutral
-                defaults (999 days / 0.0 upside / 0.5 fundamental_score) —
-                the same values these calls already fall back to on
-                failure. Exists so app.py's scan can do a cheap first pass
-                over every candidate (Alpaca + technical + news only) and
-                spend Finnhub's free-tier rate budget (60 calls/min) only
-                on the top-ranked candidates in a second pass, rather than
-                bursting ~3,000 calls at it for a ~1,600-ticker universe
-                and having nearly all of them 429 (confirmed directly: a
-                16-way parallel burst got only 12/50 calls through).
+            fundamentals: Pre-fetched row from Postgres's ticker_fundamentals
+                table (see app.py's _load_ticker_fundamentals_bulk), or None
+                if this ticker hasn't been refreshed yet. This method never
+                calls Finnhub itself — app.py bulk-fetches fundamentals for
+                every candidate up front (one query, not one per ticker) and
+                passes each one in here, the same batching discipline
+                already used for price/OHLCV/options data. Missing/None
+                falls back to the same neutral defaults Finnhub's own
+                failure path always used (999 days / 0.0 upside / 0.5
+                fundamental_score) — a ticker Postgres hasn't seen yet reads
+                identically to a live Finnhub call that failed.
 
         Returns:
             AnalysisResult with comprehensive analysis
@@ -307,13 +310,21 @@ class MCPStockAgent:
             technical_data = self._fetch_real_technical_data(ticker, price)
             options_data   = self._fetch_real_options_data(ticker, price)
             market_data    = self._fetch_real_market_data()
-            if use_finnhub:
-                fundamental    = self._fetch_real_fundamental_data(ticker, price)
-                days_to_earn   = self._fetch_earnings_date(ticker)
+            fundamentals   = fundamentals or {}
+            fundamental    = {
+                'analyst_upside':     fundamentals.get('analyst_upside') or 0.0,
+                'short_interest_pct': 0.0,  # no free short-interest source on Finnhub
+                'analyst_count':      fundamentals.get('analyst_count') or 0,
+                'fundamental_score':  fundamentals.get('fundamental_score')
+                                       if fundamentals.get('fundamental_score') is not None else 0.5,
+            }
+            earnings_date = fundamentals.get('earnings_date')
+            if earnings_date:
+                from datetime import date as _date
+                ed = earnings_date if isinstance(earnings_date, _date) else _date.fromisoformat(str(earnings_date))
+                days_to_earn = max(0, (ed - _date.today()).days)
             else:
-                fundamental    = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
-                                   'analyst_count': 0,    'fundamental_score': 0.5}
-                days_to_earn   = 999
+                days_to_earn = 999
 
             # Run all analyzers
             # news_data and technical_data are pre-formatted simulation dicts;
@@ -1473,149 +1484,6 @@ class MCPStockAgent:
         except Exception as e:
             logger.debug(f"[Options] {ticker} Alpaca fetch failed: {e}")
             return self._generate_options_data()
-
-    # -----------------------------------------------------------------------
-    # Expert signals: earnings date + fundamental data
-    # -----------------------------------------------------------------------
-
-    def _fetch_earnings_date(self, ticker: str) -> int:
-        """Return days until next earnings announcement (999 = unknown/far out). 24h cache.
-        Finnhub-backed — replaced yfinance's .calendar scrape as part of
-        removing yfinance entirely after Yahoo blocked Railway's production
-        IP (see _fetch_real_options_data's docstring for the full incident).
-        Free-tier Finnhub confirmed working for this specific endpoint via
-        direct testing (real upcoming dates for AAPL/AMD/MSFT, empty array
-        for a nonexistent ticker — no auth/tier restriction hit here, unlike
-        the price-target endpoint)."""
-        now = datetime.utcnow()
-        if ticker in self._earnings_cache:
-            cached_days, fetched_at = self._earnings_cache[ticker]
-            if (now - fetched_at).total_seconds() < 86400:
-                return cached_days
-        days = 999
-        success = False  # only cache on real success — a 429/timeout must
-        # not lock a ticker at the default for the full 24h TTL, or a
-        # single rate-limited moment "poisons" it for the rest of the day.
-        try:
-            import requests
-            from datetime import date as _date, timedelta as _timedelta
-            api_key = os.environ.get('FINNHUB_API_KEY', '')
-            if not api_key:
-                raise RuntimeError("Finnhub API key not configured")
-            today = _date.today()
-            finnhub_limiter.acquire()
-            resp = requests.get(
-                "https://finnhub.io/api/v1/calendar/earnings",
-                params={
-                    "from": today.isoformat(),
-                    "to": (today + _timedelta(days=180)).isoformat(),
-                    "symbol": ticker,
-                    "token": api_key,
-                },
-                timeout=10,
-            )
-            resp.raise_for_status()
-            events = resp.json().get("earningsCalendar") or []
-            if events:
-                # Events come back sorted by date already; take the soonest.
-                earn_date = _date.fromisoformat(events[0]["date"])
-                days = max(0, (earn_date - today).days)
-            success = True
-        except Exception as e:
-            logger.debug(f"[Earnings] {ticker} Finnhub fetch failed: {e}")
-        if success:
-            self._earnings_cache[ticker] = (days, now)
-        return days
-
-    def _fetch_real_fundamental_data(self, ticker: str, price: float) -> Dict:
-        """Fetch analyst consensus and short interest. 4-hour cache.
-        Finnhub-backed — replaced yfinance's .info scrape (see
-        _fetch_real_options_data's docstring for the yfinance-removal
-        incident this is part of). Finnhub's free tier blocks its
-        price-target endpoint outright ("You don't have access to this
-        resource", confirmed directly) and has no short-interest data at
-        any tier we tested — only its recommendation-trends endpoint
-        (buy/hold/sell analyst counts) is both free and populated. Per
-        explicit product decision: analyst_upside is no longer a literal
-        "target price vs current price" percentage (that data isn't
-        available for free anywhere) — it's now a consensus-derived
-        proxy on a comparable scale, computed from the real buy/hold/sell
-        distribution rather than a fabricated number. short_interest_pct
-        stays 0.0 / neutral, same as the pre-existing "no data" branch
-        below already handled when yfinance had nothing either."""
-        now = datetime.utcnow()
-        if ticker in self._fundamental_cache:
-            cached, fetched_at = self._fundamental_cache[ticker]
-            if (now - fetched_at).total_seconds() < 14400:
-                return cached
-
-        result = {'analyst_upside': 0.0, 'short_interest_pct': 0.0,
-                  'analyst_count': 0,    'fundamental_score': 0.5}
-        success = False  # only cache on real success — see _fetch_earnings_date
-        try:
-            import requests
-            api_key = os.environ.get('FINNHUB_API_KEY', '')
-            if not api_key:
-                raise RuntimeError("Finnhub API key not configured")
-            finnhub_limiter.acquire()
-            resp = requests.get(
-                "https://finnhub.io/api/v1/stock/recommendation",
-                params={"symbol": ticker, "token": api_key},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            periods = resp.json() or []
-            short_float = 0.0  # not available free on any tested tier
-
-            if periods:
-                latest = periods[0]  # API returns most-recent period first
-                strong_buy = int(latest.get('strongBuy') or 0)
-                buy = int(latest.get('buy') or 0)
-                hold = int(latest.get('hold') or 0)
-                sell = int(latest.get('sell') or 0)
-                strong_sell = int(latest.get('strongSell') or 0)
-                n_analysts = strong_buy + buy + hold + sell + strong_sell
-
-                if n_analysts > 0:
-                    # Per-analyst-weighted sentiment: +2/+1/0/-1/-2, normalized
-                    # to [-1, 1] by the maximum possible weight (unanimous
-                    # strongBuy or strongSell).
-                    consensus = (2 * strong_buy + buy - sell - 2 * strong_sell) / (2 * n_analysts)
-                    # Mapped onto the same rough magnitude range real analyst
-                    # upside percentages tend to fall in (-25% to +25%) so
-                    # this reads comparably to the old field, while being
-                    # honestly consensus-derived rather than a price target.
-                    upside = round(consensus * 25, 1)
-                else:
-                    upside = 0.0
-            else:
-                n_analysts = 0
-                upside = 0.0
-
-            # upside score: same shape as before — 0%→0.3, 10%→0.6, 25%+→1.0
-            upside_score = min(1.0, max(0.0, 0.3 + upside / 35.0))
-            # short squeeze score: neutral default — no free short-interest source
-            short_score = min(1.0, short_float / 0.15) if short_float > 0 else 0.3
-
-            # Only trust consensus if ≥3 analysts cover the stock
-            if n_analysts >= 3:
-                fund_score = round(upside_score * 0.75 + short_score * 0.25, 4)
-            else:
-                fund_score = 0.5  # neutral when no coverage
-
-            result = {
-                'analyst_upside':    upside,
-                'short_interest_pct': round(short_float * 100, 1),
-                'analyst_count':     n_analysts,
-                'fundamental_score': fund_score,
-            }
-            success = True
-        except Exception as e:
-            logger.debug("[Fundamentals] %s failed: %s", ticker, e)
-
-        if success:
-            self._fundamental_cache[ticker] = (result, now)
-        return result
 
     # -----------------------------------------------------------------------
     # Fallback generators (used when yfinance data is unavailable)
